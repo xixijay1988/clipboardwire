@@ -300,7 +300,6 @@ mod backend {
 
     use anyhow::{anyhow, Context, Result};
     use objc2::rc::Retained;
-    use objc2::AnyThread;
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
     use objc2_foundation::{NSArray, NSString, NSURL};
 
