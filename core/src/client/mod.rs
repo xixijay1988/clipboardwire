@@ -37,7 +37,13 @@ pub async fn run_with_status(
 ) -> Result<()> {
     let poll_ms = config.poll_ms;
     let (clipboard, _clipboard_join) = clipboard::spawn(poll_ms)?;
-    let (transport, _transport_join) = transport::spawn_with_status(config, status_tx);
+    let (transport, transport_join) = transport::spawn_with_status(config, status_tx);
+    // Killing the supervisor task (e.g. tray config reload) drops this
+    // future, so the guard aborts the transport run_loop too. Without
+    // it the orphaned transport reconnects forever — its channels are
+    // closed, so every connection is a ~100 ms phantom that the hub
+    // sees churning once per backoff cycle.
+    let _transport_guard = crate::task::AbortOnDrop(transport_join);
     run_supervisor(clipboard, transport).await;
     Ok(())
 }
@@ -141,6 +147,15 @@ pub async fn run_supervisor(mut clipboard: Clipboard, mut transport: Transport) 
                         continue;
                     }
                 };
+                match &change {
+                    ClipChange::Text(t) => {
+                        tracing::info!(len = t.len(), "applying inbound text clip to local clipboard")
+                    }
+                    ClipChange::Image(i) => {
+                        tracing::info!(bytes = i.rgba.len(), "applying inbound image clip to local clipboard")
+                    }
+                    ClipChange::Files(_) => {}
+                }
                 if let Err(e) = clipboard.apply_tx.send(change) {
                     warn!(error = %e, "clipboard thread is gone");
                     return;

@@ -67,6 +67,7 @@ struct Seen {
     image: Option<ImageBytes>,
     files: Option<Vec<PathBuf>>,
     files_err_streak: u32,
+    files_absent_streak: u32,
 }
 
 /// How many consecutive `read_files` failures we tolerate before giving
@@ -75,6 +76,14 @@ struct Seen {
 /// transient read error mid-file-copy, short enough that a permanently
 /// broken backend doesn't silently kill image/text sync.
 const MAX_FILES_READ_ERRORS: u32 = 3;
+
+/// How many consecutive *clean* "no files" reads we tolerate before
+/// releasing file-suppression. A single `NoFiles` report can be the
+/// backend catching the pasteboard mid-rewrite — clipboard managers
+/// (e.g. input-method clipboard history) briefly publish a file copy
+/// without its file URLs — so one tick is not proof the files are gone.
+/// Same ~1 s budget as the error streak.
+const MAX_FILES_ABSENT_TICKS: u32 = 3;
 
 impl Seen {
     /// Record a locally-applied remote clip. Writing any representation
@@ -87,16 +96,19 @@ impl Seen {
                 self.text = Some(t.clone());
                 self.image = None;
                 self.files = None;
+                self.files_absent_streak = 0;
             }
             ClipChange::Image(i) => {
                 self.image = Some(i.clone());
                 self.text = None;
                 self.files = None;
+                self.files_absent_streak = 0;
             }
             ClipChange::Files(p) => {
                 self.files = Some(p.clone());
                 self.text = None;
                 self.image = None;
+                self.files_absent_streak = 0;
             }
         }
     }
@@ -140,6 +152,7 @@ fn decide(
     match files {
         FilesRead::Files(paths) => {
             seen.files_err_streak = 0;
+            seen.files_absent_streak = 0;
             if seen.files.as_deref() == Some(paths.as_slice()) {
                 return None;
             }
@@ -152,7 +165,19 @@ fn decide(
         }
         FilesRead::NoFiles => {
             seen.files_err_streak = 0;
-            seen.files = None;
+            if seen.files.is_some() {
+                seen.files_absent_streak += 1;
+                if seen.files_absent_streak <= MAX_FILES_ABSENT_TICKS {
+                    // Keep treating the clipboard as file-occupied: a
+                    // lone empty read is likely the backend catching a
+                    // mid-rewrite. Releasing here would let the shadow
+                    // icon/name escape over the wire.
+                    return None;
+                }
+                seen.files = None;
+            } else {
+                seen.files_absent_streak = 0;
+            }
         }
         FilesRead::Error => {
             seen.files_err_streak += 1;
@@ -531,7 +556,11 @@ mod tests {
             TextRead::Error,
         );
 
-        // New copy is plain text; files read now reports none.
+        // New copy is plain text; files read reports none for long
+        // enough that suppression releases.
+        for _ in 0..=MAX_FILES_ABSENT_TICKS {
+            decide(&mut seen, FilesRead::NoFiles, None, TextRead::Error);
+        }
         let out = decide(
             &mut seen,
             FilesRead::NoFiles,
@@ -566,13 +595,11 @@ mod tests {
         );
         assert_eq!(out, Some(ClipChange::Files(paths.clone())));
 
-        // Intervening text copy clears the files tracker.
-        decide(
-            &mut seen,
-            FilesRead::NoFiles,
-            None,
-            TextRead::Value("x".into()),
-        );
+        // Intervening text copy — files absent long enough to clear
+        // the tracker.
+        for _ in 0..=MAX_FILES_ABSENT_TICKS {
+            decide(&mut seen, FilesRead::NoFiles, None, TextRead::Error);
+        }
 
         let out = decide(
             &mut seen,
@@ -667,5 +694,73 @@ mod tests {
             }
         }
         assert_eq!(emitted, vec![ClipChange::Files(docx_paths())]);
+    }
+
+    /// A single NoFiles report must not release file-suppression: the
+    /// backend can catch the pasteboard mid-rewrite (e.g. a clipboard
+    /// manager briefly publishing a copy without file URLs), and an
+    /// immediate release lets the icon/name shadows ride the wire.
+    #[test]
+    fn nofiles_report_is_debounced() {
+        let mut seen = Seen::default();
+        decide(
+            &mut seen,
+            FilesRead::Files(docx_paths()),
+            None,
+            TextRead::Error,
+        );
+
+        for _ in 0..MAX_FILES_ABSENT_TICKS {
+            let out = decide(
+                &mut seen,
+                FilesRead::NoFiles,
+                Some(icon()),
+                TextRead::Value("report.docx".into()),
+            );
+            assert_eq!(out, None);
+        }
+
+        // Streak exceeded — the clipboard is truly file-free now, so the
+        // image rep may flow again.
+        let out = decide(
+            &mut seen,
+            FilesRead::NoFiles,
+            Some(icon()),
+            TextRead::Value("report.docx".into()),
+        );
+        assert_eq!(out, Some(ClipChange::Image(icon())));
+    }
+
+    /// A Files read between absent ticks resets the streak — only
+    /// *consecutive* empty reads release suppression.
+    #[test]
+    fn files_read_resets_absent_streak() {
+        let mut seen = Seen::default();
+        decide(
+            &mut seen,
+            FilesRead::Files(docx_paths()),
+            None,
+            TextRead::Error,
+        );
+
+        for _ in 0..MAX_FILES_ABSENT_TICKS {
+            decide(&mut seen, FilesRead::NoFiles, None, TextRead::Error);
+        }
+        // Same files back on the clipboard — no emission, streak reset.
+        let out = decide(
+            &mut seen,
+            FilesRead::Files(docx_paths()),
+            None,
+            TextRead::Error,
+        );
+        assert_eq!(out, None);
+
+        // Full budget again before release.
+        for _ in 0..MAX_FILES_ABSENT_TICKS {
+            let out = decide(&mut seen, FilesRead::NoFiles, Some(icon()), TextRead::Error);
+            assert_eq!(out, None);
+        }
+        let out = decide(&mut seen, FilesRead::NoFiles, Some(icon()), TextRead::Error);
+        assert_eq!(out, Some(ClipChange::Image(icon())));
     }
 }

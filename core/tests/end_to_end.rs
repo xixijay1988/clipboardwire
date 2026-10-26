@@ -287,3 +287,61 @@ async fn await_count(stats: &HubStatsSink, expected: usize) {
         stats.current()
     );
 }
+
+/// Regression for the tray-reload split-brain: `serve` must take its
+/// hub actor down with it. The tray reloads the embedded hub by
+/// *aborting* the serve task; previously the hub actor and every
+/// per-connection task leaked — clients on the old listener kept
+/// publishing into a dead-end registry while new connections landed
+/// on the freshly spawned hub, so frames vanished silently.
+///
+/// With the abort-on-drop guard, aborting `serve` kills the actor:
+/// its client-registry senders drop, each connection's writer channel
+/// closes, and the socket follows — giving the peer a clean close it
+/// can reconnect through.
+#[tokio::test]
+async fn aborted_serve_closes_existing_connections() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = ServerConfig {
+        bind: addr,
+        user: USER.to_string(),
+        password: PW.to_string(),
+        max_conns: 8,
+        max_frame_bytes: 1024 * 1024,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_disabled: true,
+        state_dir: None,
+        stats: None,
+    };
+    let serve_task = tokio::spawn(clipboardwire_core::server::serve(
+        listener,
+        cfg,
+        std::future::pending(),
+    ));
+
+    let (mut ws, _id) = connect_and_welcome(addr, USER, PW).await;
+
+    // Kill the server exactly the way the tray kills it on reload.
+    serve_task.abort();
+
+    // The hub actor dies with serve, which closes every registered
+    // connection's outbound channels — the client must see the socket
+    // end rather than sit on a dead-end session forever.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                // Ping/Pong keepalives may interleave before the close.
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("connection did not close after serve abort");
+    match outcome {
+        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {}
+        other => panic!("expected close/error/end-of-stream, got {other:?}"),
+    }
+}

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::protocol::{ClipFrame, FileChunkFrame};
@@ -199,7 +199,7 @@ impl Hub {
                     s.count.fetch_add(1, Ordering::Relaxed);
                 }
                 let snapshot = self.last_clip.clone();
-                debug!(client = %id, total = self.clients.len(), "registered");
+                info!(client = %id, total = self.clients.len(), "client registered with hub");
                 let _ = ack.send(RegisterResult::Accepted {
                     last_clip: snapshot,
                 });
@@ -209,7 +209,7 @@ impl Hub {
                     if let Some(s) = &self.stats {
                         s.count.fetch_sub(1, Ordering::Relaxed);
                     }
-                    debug!(client = %id, total = self.clients.len(), "deregistered");
+                    info!(client = %id, total = self.clients.len(), "client deregistered from hub");
                 }
             }
             HubMessage::Publish { from, mut clip } => {
@@ -234,12 +234,13 @@ impl Hub {
             }
             HubMessage::PublishFile { from, mut chunk } => {
                 chunk.from = Some(from);
+                let mut delivered = 0usize;
                 for (peer_id, channels) in self.clients.iter() {
                     if *peer_id == from {
                         continue;
                     }
                     match channels.file.try_send(chunk.clone()) {
-                        Ok(()) => {}
+                        Ok(()) => delivered += 1,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             // File transfers tolerate a missed chunk
                             // poorly (the assembled file would be
@@ -257,6 +258,17 @@ impl Hub {
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {}
                     }
+                }
+                if delivered == 0 {
+                    // A sender relaying into a hub with no other
+                    // registered clients is a silent data hole — this
+                    // is exactly what a leaked/zombie hub looks like.
+                    warn!(
+                        file = %chunk.name,
+                        index = chunk.chunk_index,
+                        total = self.clients.len(),
+                        "file_chunk relayed to zero peers"
+                    );
                 }
             }
         }
@@ -306,6 +318,24 @@ mod tests {
             content_b64: None,
             from: None,
         }
+    }
+
+    /// Killing the hub actor drops the client registry — every
+    /// registered connection's outbound channels close, which is what
+    /// terminates the old hub's sockets on a reload.
+    #[tokio::test]
+    async fn actor_death_closes_registered_client_channels() {
+        let (hub, join) = spawn(8);
+        let (clip_tx, mut clip_rx) = mpsc::channel::<ClipFrame>(1);
+        let (file_tx, mut file_rx) = mpsc::channel::<FileChunkFrame>(1);
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            hub.register(id, clip_tx, file_tx).await.unwrap(),
+            RegisterResult::Accepted { .. }
+        ));
+        join.abort();
+        assert!(clip_rx.recv().await.is_none());
+        assert!(file_rx.recv().await.is_none());
     }
 
     #[tokio::test]

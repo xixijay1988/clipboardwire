@@ -134,7 +134,7 @@ async fn handle_socket(
 
     // Writer task: owns the sink, multiplexes the three sources.
     let writer_state = state.clone();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let mut sink = sink;
         let mut ping_timer = interval(PING_INTERVAL);
         // Skip the immediate first tick so we don't ping on connect.
@@ -199,7 +199,7 @@ async fn handle_socket(
     // hub or emits an `error` and exits.
     let reader_hub = state.hub.clone();
     let reader_internal_tx = internal_tx.clone();
-    let reader = tokio::spawn(async move {
+    let mut reader = tokio::spawn(async move {
         loop {
             let next = tokio::time::timeout(READ_TIMEOUT, stream.next()).await;
             let msg = match next {
@@ -304,10 +304,15 @@ async fn handle_socket(
         debug!("reader exiting");
     });
 
-    // Wait for either side to end, then tear the other down.
+    // Wait for either side to end, then tear the other down — the
+    // surviving half still owns its share of the socket, so without
+    // the abort a half-dead session lingers as a live-but-silent
+    // connection (e.g. hub actor killed on reload → writer exits on
+    // channel close → reader would otherwise sit on `stream.next()`
+    // holding the socket open until READ_TIMEOUT).
     tokio::select! {
-        _ = reader => {},
-        _ = writer => {},
+        _ = &mut reader => writer.abort(),
+        _ = &mut writer => reader.abort(),
     }
     state.hub.deregister(client_id).await;
     info!("connection closed");

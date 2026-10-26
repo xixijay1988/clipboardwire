@@ -70,7 +70,12 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     if config.tls_disabled {
-        let (app, _hub_join) = build_app(config);
+        let (app, hub_join) = build_app(config);
+        // If this serve future is aborted (tray reload), the guard kills
+        // the hub actor: its client-registry senders drop, each open
+        // connection's writer channel closes, and those connections
+        // terminate so their clients can re-register on the new hub.
+        let _hub_guard = crate::task::AbortOnDrop(hub_join);
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -141,12 +146,14 @@ async fn serve_tls(
         .context("set_nonblocking on TLS listener")?;
     let handle = axum_server::Handle::new();
     let handle_for_shutdown = handle.clone();
-    tokio::spawn(async move {
+    let shutdown_watch = tokio::spawn(async move {
         shutdown.await;
         handle_for_shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     });
+    let _shutdown_watch_guard = crate::task::AbortOnDrop(shutdown_watch);
 
-    let (app, _hub_join) = build_app(config);
+    let (app, hub_join) = build_app(config);
+    let _hub_guard = crate::task::AbortOnDrop(hub_join);
     axum_server::from_tcp_rustls(std_listener, tls)
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
