@@ -48,6 +48,13 @@ fn client_cfg(addr: std::net::SocketAddr) -> ClientConfig {
         tls_ca_file: None,
         tls_insecure: false,
         hub: None,
+        log_file_names: false,
+        send_mode: Default::default(),
+        receive_mode: Default::default(),
+        pickup_auto: false,
+        offer_ttl_minutes: 30,
+        pull_window_chunks: 3,
+        pull_idle_timeout_secs: 30,
     }
 }
 
@@ -63,6 +70,17 @@ async fn wait_for_connected(rx: &mut watch::Receiver<ClientStatus>) {
         if rx.changed().await.is_err() {
             panic!("status channel dropped before Connected");
         }
+    }
+}
+
+fn clip_frame(id: uuid::Uuid, text: &str) -> clipboardwire_core::protocol::ClipFrame {
+    clipboardwire_core::protocol::ClipFrame {
+        id,
+        ts: 0,
+        content_type: clipboardwire_core::protocol::TEXT_CONTENT_TYPE.to_string(),
+        content: Some(text.to_string()),
+        content_b64: None,
+        from: None,
     }
 }
 
@@ -103,6 +121,7 @@ async fn file_sent_by_one_client_arrives_intact_at_the_other() {
             status_tx: Some(recv_status_tx),
             receive_files: true,
             one_shot: false,
+            ..SpawnOptions::default()
         },
     );
     let mut inbound_files_rx = receiver_transport
@@ -136,6 +155,7 @@ async fn file_sent_by_one_client_arrives_intact_at_the_other() {
             status_tx: Some(send_status_tx),
             receive_files: false,
             one_shot: true,
+            ..SpawnOptions::default()
         },
     );
 
@@ -205,6 +225,7 @@ async fn multi_chunk_file_round_trips_intact() {
             status_tx: Some(recv_status_tx),
             receive_files: true,
             one_shot: false,
+            ..SpawnOptions::default()
         },
     );
     let mut inbound_files_rx = receiver_transport.inbound_files_rx.take().unwrap();
@@ -229,6 +250,7 @@ async fn multi_chunk_file_round_trips_intact() {
             status_tx: Some(send_status_tx),
             receive_files: false,
             one_shot: true,
+            ..SpawnOptions::default()
         },
     );
 
@@ -261,4 +283,171 @@ async fn multi_chunk_file_round_trips_intact() {
 
     let _ = fs::remove_dir_all(&send_dir);
     let _ = fs::remove_dir_all(&receiver_save_dir);
+}
+
+/// Repeatedly drive the exact shutdown shape that lost chunks.
+///
+/// `drop(sender_transport)` closes all three outbound channels at once, and
+/// `select!` picks among ready arms at random. Before the shared drain, an arm
+/// observing a *closed but empty* control channel returned immediately while
+/// the file channel still held most of the transfer — the receiver then waited
+/// for a chunk that never came.
+///
+/// One pass proves nothing: the bug reproduced roughly one run in three. Each
+/// iteration here is a full connect → send → drop → assemble cycle against a
+/// fresh payload, so nineteen passes and one failure is still a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_the_transport_flushes_queued_chunks_whichever_arm_wins() {
+    const ITERATIONS: usize = 20;
+    /// Enough that the transport cannot plausibly drain them all before the
+    /// drop lands on a 4-worker runtime. The outbound clip buffer holds 8.
+    const CLIPS_PER_ROUND: usize = 6;
+    // Two chunks' worth: one chunk can be handed to the socket before the race
+    // is decided, so a single-chunk payload would often pass by luck.
+    const PAYLOAD_BYTES: usize = 9 * 1024 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = server_cfg(addr);
+    cfg.max_frame_bytes = 16 * 1024 * 1024;
+    let (app, _hub_join) = build_app(cfg);
+    let _server_task = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    let save_dir = unique_tmp_dir("flush-rec");
+    let (mut receiver_transport, _r_join) = spawn_with_options(
+        client_cfg(addr),
+        SpawnOptions {
+            status_tx: None,
+            receive_files: true,
+            one_shot: false,
+            ..SpawnOptions::default()
+        },
+    );
+    let mut inbound_files_rx = receiver_transport.inbound_files_rx.take().unwrap();
+    let mut inbound_rx = receiver_transport.inbound_rx;
+
+    // One receiver loop for all iterations: it reports the assembled path per
+    // completed file, so a lost chunk shows up as a missing report rather than
+    // as a stuck receiver that has to be restarted.
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let save_dir_for_task = save_dir.clone();
+    let _receiver_task = tokio::spawn(async move {
+        let mut receiver = FileReceiver::with_save_dir(save_dir_for_task).unwrap();
+        while let Some(chunk) = inbound_files_rx.recv().await {
+            match receiver.receive_chunk(chunk) {
+                Ok(Some(path)) => {
+                    let _ = done_tx.send(path);
+                }
+                Ok(None) => {}
+                Err(e) => panic!("receiver rejected a chunk: {e:#}"),
+            }
+        }
+    });
+
+    // Give the receiver a moment to finish its handshake; it has no status
+    // channel here, and the sender's connect is what matters below.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let send_dir = unique_tmp_dir("flush-send");
+
+    for iteration in 0..ITERATIONS {
+        let mut payload = vec![0u8; PAYLOAD_BYTES];
+        for (i, b) in payload.iter_mut().enumerate() {
+            // Distinct per iteration so a stale file from an earlier round can
+            // never satisfy this round's assertion.
+            *b = ((i.wrapping_mul(31)).wrapping_add(iteration.wrapping_mul(97)) & 0xff) as u8;
+        }
+        let src_path = send_dir.join(format!("iter-{iteration}.bin"));
+        fs::write(&src_path, &payload).unwrap();
+
+        let (send_status_tx, mut send_status_rx) = watch::channel(ClientStatus::Connecting);
+        let (sender_transport, sender_join) = spawn_with_options(
+            client_cfg(addr),
+            SpawnOptions {
+                status_tx: Some(send_status_tx),
+                receive_files: false,
+                one_shot: true,
+                ..SpawnOptions::default()
+            },
+        );
+        wait_for_connected(&mut send_status_rx).await;
+        // `Connected` is emitted before the welcome is consumed and the inner
+        // `select!` starts listening.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        send_file_through(&src_path, &sender_transport.outbound_files_tx)
+            .await
+            .expect("send_file_through");
+
+        // Several clips in the queue too, so all three outbound channels carry
+        // work when they close. One is not enough: the transport can drain a
+        // single clip before the drop lands, and then a bare `return` on the
+        // file arm would look harmless while in reality it drops whatever is
+        // still queued.
+        let clip_ids: Vec<uuid::Uuid> =
+            (0..CLIPS_PER_ROUND).map(|_| uuid::Uuid::new_v4()).collect();
+        for (index, id) in clip_ids.iter().enumerate() {
+            sender_transport
+                .outbound_tx
+                .send(clip_frame(*id, &format!("iteration-{iteration}-{index}")))
+                .await
+                .expect("queue a clip");
+        }
+
+        // The shutdown under test: all three outbound channels close at once.
+        drop(sender_transport);
+        let _ = tokio::time::timeout(Duration::from_secs(5), sender_join).await;
+
+        let final_path = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("iteration {iteration}: file never assembled; queued chunks were lost")
+            })
+            .unwrap_or_else(|| panic!("iteration {iteration}: receiver task ended"));
+
+        let received = fs::read(&final_path).expect("assembled file readable");
+        assert_eq!(
+            received.len(),
+            payload.len(),
+            "iteration {iteration}: size mismatch"
+        );
+        assert!(
+            received == payload,
+            "iteration {iteration}: content mismatch"
+        );
+        let _ = fs::remove_file(&final_path);
+
+        // The clips were queued behind the chunks, so they are the ones most
+        // likely to still be sitting in their channel when the shutdown race is
+        // decided. All of them must arrive: a bare `return` on any arm loses
+        // however many remained.
+        let mut seen: Vec<uuid::Uuid> = Vec::new();
+        for slot in 0..CLIPS_PER_ROUND {
+            let clip = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "iteration {iteration}: only {slot} of {CLIPS_PER_ROUND} queued clips \
+                         arrived; the rest were dropped on shutdown"
+                    )
+                })
+                .expect("inbound clip channel stayed open");
+            seen.push(clip.id);
+        }
+        // Hub relay preserves nothing about ordering across channels, so
+        // compare as a set.
+        seen.sort_unstable();
+        let mut expected = clip_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(seen, expected, "iteration {iteration}: a clip was lost");
+    }
+
+    let _ = fs::remove_dir_all(&send_dir);
+    let _ = fs::remove_dir_all(&save_dir);
 }

@@ -8,6 +8,12 @@
 //! See `PROTOCOL.md` and `ARCHITECTURE.md` in the repository root.
 
 pub mod client;
+pub mod identity;
+pub mod logging;
 pub mod protocol;
 pub mod server;
 pub(crate) mod task;
+
+// The module file carries `#![cfg(test)]`; registering it unconditionally here
+// would require a second `#[cfg(test)]` for the same purpose.
+pub(crate) mod env_lock;

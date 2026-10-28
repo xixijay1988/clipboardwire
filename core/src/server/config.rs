@@ -252,14 +252,13 @@ fn parse_env_usize(name: &str) -> Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Env vars are process-global, so tests that mutate them must serialize.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_env() {
-        // SAFETY: tests are serialized by ENV_LOCK; no concurrent threads
-        // can be reading the environment while we mutate it.
+        // SAFETY: the caller holds `crate::env_lock::lock_env()`, which is the
+        // one crate-wide lock every test that touches the process environment
+        // takes — including tests in other modules. A per-module lock would not
+        // be enough: `set_var` rewrites the shared environment block, so it
+        // races any concurrent `env::var` even in another module.
         unsafe {
             for v in [
                 "CLIPBOARDWIRE_BIND",
@@ -283,7 +282,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_user() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_PASSWORD", "pw");
         let err = ServerConfig::from_env().unwrap_err();
@@ -292,7 +291,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_password() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         let err = ServerConfig::from_env().unwrap_err();
@@ -301,7 +300,7 @@ mod tests {
 
     #[test]
     fn rejects_both_password_sources() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");
@@ -312,7 +311,7 @@ mod tests {
 
     #[test]
     fn reads_password_from_file_and_trims_newline() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         let mut p = std::env::temp_dir();
         p.push(format!("clipboardwire-test-pw-{}", std::process::id()));
@@ -326,7 +325,7 @@ mod tests {
 
     #[test]
     fn defaults_are_applied() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");
@@ -338,7 +337,7 @@ mod tests {
 
     #[test]
     fn tls_disabled_by_default() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");
@@ -350,7 +349,7 @@ mod tests {
 
     #[test]
     fn tls_enabled_when_both_files_set() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");
@@ -362,7 +361,7 @@ mod tests {
 
     #[test]
     fn tls_requires_both_cert_and_key() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");
@@ -373,7 +372,7 @@ mod tests {
 
     #[test]
     fn invalid_bind_address_is_rejected() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::env_lock::lock_env();
         clear_env();
         set("CLIPBOARDWIRE_USER", "alice");
         set("CLIPBOARDWIRE_PASSWORD", "pw");

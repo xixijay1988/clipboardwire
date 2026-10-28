@@ -141,6 +141,13 @@ mod tests {
             tls_ca_file: None,
             tls_insecure: false,
             hub: None,
+            log_file_names: false,
+            send_mode: Default::default(),
+            receive_mode: Default::default(),
+            pickup_auto: false,
+            offer_ttl_minutes: 30,
+            pull_window_chunks: 3,
+            pull_idle_timeout_secs: 30,
         }
     }
 

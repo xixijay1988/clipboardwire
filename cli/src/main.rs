@@ -188,6 +188,33 @@ async fn run_headless(cli: Cli, cmd: Command) -> Result<()> {
     }
 }
 
+/// Transport options for the one-shot `send` subcommand.
+///
+/// The device id is **ephemeral by design**, and that is not a shortcut:
+///
+/// - Two live connections sharing one device id evict each other, because the
+///   hub's rule is newest-wins. A persisted id here would make `send` kick the
+///   user's own tray offline mid-copy — the transfer would fail *and* the
+///   clipboard would stop syncing.
+/// - A fresh id per process is also what lets several sends run concurrently,
+///   and what keeps a `send` on a read-only or unwritable state dir working.
+///
+/// The persistent identity in the state dir belongs to the long-lived client.
+/// `send` is a separate, short-lived participant and says so on the wire.
+fn send_spawn_options() -> clipboardwire_core::client::transport::SpawnOptions {
+    clipboardwire_core::client::transport::SpawnOptions {
+        status_tx: None,
+        receive_files: false,
+        one_shot: true,
+        // `TransferId` is core's re-export of `uuid::Uuid`, so the CLI does
+        // not need its own uuid dependency.
+        device: Some(clipboardwire_core::client::TransferId::new_v4()),
+        // No capabilities: this build cannot consume offers (Phase 5), so
+        // advertising `lazy-file` would invite offers it can only drop.
+        caps: clipboardwire_core::protocol::Caps::default(),
+    }
+}
+
 /// `clipboardwire send <file>` — one-shot connect, publish the file as
 /// a sequence of `file_chunk` frames, exit. Reuses the client config
 /// (server URL + creds + TLS settings) the user already has.
@@ -195,17 +222,10 @@ async fn run_send_once(
     config_path: Option<&std::path::Path>,
     file: &std::path::Path,
 ) -> Result<()> {
-    use clipboardwire_core::client::transport::{spawn_with_options, SpawnOptions};
+    use clipboardwire_core::client::transport::spawn_with_options;
 
     let cfg = load_client_config_or_bail(config_path)?;
-    let (transport, join) = spawn_with_options(
-        cfg,
-        SpawnOptions {
-            status_tx: None,
-            receive_files: false,
-            one_shot: true,
-        },
-    );
+    let (transport, join) = spawn_with_options(cfg, send_spawn_options());
 
     let send_result =
         clipboardwire_core::client::file::send_file_through(file, &transport.outbound_files_tx)
@@ -283,11 +303,101 @@ fn resolve_server_config(config_path: Option<&std::path::Path>) -> Result<Server
 }
 
 async fn run_client_headless(cfg: ClientConfig) -> Result<()> {
+    // Headless has no tray, so progress goes to stderr — throttled to one line
+    // per second per transfer (task 1.6). Without the throttle a multi-chunk
+    // transfer would emit a line per 4 MiB chunk, which buries the log.
+    let (progress_tx, progress_rx) = tokio::sync::broadcast::channel(64);
+    tokio::spawn(log_progress_to_stderr(progress_rx));
+
     tokio::select! {
-        res = clipboardwire_core::client::run(cfg) => res,
+        res = clipboardwire_core::client::run_with_status(cfg, None, Some(progress_tx)) => res,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             Ok(())
+        }
+    }
+}
+
+/// Print at most one progress line per second per transfer to stderr.
+///
+/// State transitions (`Hashing`, `Verifying`, terminal states) always print,
+/// because those are the interesting moments; only the per-chunk `Pulling`
+/// stream is throttled. A long transfer therefore shows start, one line a
+/// second, and the end, with no chunk-level spam.
+/// Last line printed for one transfer, and when.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy)]
+struct LastLogLine {
+    at: std::time::Instant,
+    state: clipboardwire_core::client::ProgressState,
+}
+
+/// At most one stderr line per second per transfer, regardless of state.
+const PROGRESS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether this progress event deserves a stderr line.
+///
+/// Throttled **by transfer**, not by state: throttling only `Pulling` let the
+/// `Hashing` stream through untouched, which is ~101 lines per file — exactly
+/// the spam this is meant to prevent.
+///
+/// Two events always print regardless of the interval: a state change (the
+/// interesting moments are hashing→pulling→done, not the percentages between
+/// them) and a terminal state (the user must see how it ended).
+fn should_log_progress(
+    previous: Option<LastLogLine>,
+    event: &clipboardwire_core::client::TransferProgress,
+    now: std::time::Instant,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.state != event.state {
+        return true;
+    }
+    if event.state.is_terminal() {
+        return true;
+    }
+    now.duration_since(previous.at) >= PROGRESS_LOG_INTERVAL
+}
+
+async fn log_progress_to_stderr(
+    mut rx: tokio::sync::broadcast::Receiver<clipboardwire_core::client::TransferProgress>,
+) {
+    use clipboardwire_core::client::TransferId;
+    use std::collections::HashMap;
+
+    let mut last_print: HashMap<TransferId, LastLogLine> = HashMap::new();
+    loop {
+        let event = match rx.recv().await {
+            Ok(e) => e,
+            // Dropping behind is fine: the next event carries the same
+            // cumulative `bytes_done`, so nothing is lost but intermediate
+            // percentages.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let now = std::time::Instant::now();
+        if !should_log_progress(last_print.get(&event.file_id).copied(), &event, now) {
+            continue;
+        }
+        last_print.insert(
+            event.file_id,
+            LastLogLine {
+                at: now,
+                state: event.state,
+            },
+        );
+        // stderr, not tracing: the requirement is a line per second on the
+        // terminal, and the tracing layer already writes INFO to stderr with
+        // a timestamp prefix that would make these lines unskimmable.
+        eprintln!(
+            "clipboardwire: {} ({})",
+            event.summary_line(64),
+            event.state.as_str()
+        );
+        if event.state.is_terminal() {
+            last_print.remove(&event.file_id);
         }
     }
 }
@@ -357,26 +467,42 @@ fn build_host_client_config(
     };
     let loopback_url = format!("{scheme}://127.0.0.1:{port}/sync");
 
-    let (user, password, poll_ms) = match override_path {
-        Some(p) => {
-            let cfg = ClientConfig::load(p).with_context(|| format!("loading {}", p.display()))?;
-            (cfg.user, cfg.password, cfg.poll_ms)
-        }
-        None => (server_cfg.user.clone(), server_cfg.password.clone(), 300),
+    // Build the in-process hop's config from the override file when there is
+    // one, then overwrite only the fields the hop itself dictates. Everything
+    // else — the transfer modes, the TTL, the pull window — is the user's
+    // choice, not a property of the loopback hop; dropping them here would
+    // make `host` mode quietly ignore a valid `config.toml`.
+    //
+    // `ClientConfig::load` has already run `validate()` (including
+    // `validate_modes`), so those values are known-good.
+    let mut cfg = match override_path {
+        Some(p) => ClientConfig::load(p).with_context(|| format!("loading {}", p.display()))?,
+        None => ClientConfig {
+            server: String::new(),
+            user: server_cfg.user.clone(),
+            password: server_cfg.password.clone(),
+            poll_ms: 300,
+            tls_ca_file: None,
+            tls_insecure: false,
+            hub: None,
+            log_file_names: false,
+            send_mode: Default::default(),
+            receive_mode: Default::default(),
+            pickup_auto: false,
+            offer_ttl_minutes: 30,
+            pull_window_chunks: 3,
+            pull_idle_timeout_secs: 30,
+        },
     };
 
-    Ok(ClientConfig {
-        server: loopback_url,
-        user,
-        password,
-        poll_ms,
-        tls_ca_file: None,
-        // Loopback in host mode often pairs with a public-cert TLS hub;
-        // the cert's SAN won't cover 127.0.0.1. Skip cert verification on
-        // this in-process hop only.
-        tls_insecure: server_cfg.tls_enabled(),
-        hub: None,
-    })
+    cfg.server = loopback_url;
+    cfg.hub = None;
+    // Loopback in host mode often pairs with a public-cert TLS hub; the cert's
+    // SAN won't cover 127.0.0.1. Skip cert verification on this in-process hop
+    // only, and ignore any CA bundle aimed at the real server.
+    cfg.tls_insecure = server_cfg.tls_enabled();
+    cfg.tls_ca_file = None;
+    Ok(cfg)
 }
 
 /// Tray mode: the main thread is given to tao's event loop so the OS
@@ -497,4 +623,130 @@ fn prepare_host_tray_args(
     });
 
     Ok((path, client_cfg, hub_handle))
+}
+
+#[cfg(test)]
+mod progress_log_tests {
+    use super::*;
+    use clipboardwire_core::client::{Direction, ProgressState, TransferId, TransferProgress};
+    use std::time::{Duration, Instant};
+
+    fn event(state: ProgressState, done: u64) -> TransferProgress {
+        TransferProgress {
+            file_id: TransferId::from_u128(1),
+            transfer_id: None,
+            direction: Direction::Send,
+            peer: None,
+            name: "a.bin".to_string(),
+            bytes_done: done,
+            bytes_total: 100,
+            state,
+        }
+    }
+
+    fn last(at: Instant, state: ProgressState) -> LastLogLine {
+        LastLogLine { at, state }
+    }
+
+    #[test]
+    fn the_send_subcommand_does_not_reuse_the_persisted_identity() {
+        // A one-shot send that adopted the tray's device id would evict the
+        // tray: the hub's rule is newest-wins, so the second connection kicks
+        // the first. The transfer would fail and clipboard sync would stop.
+        //
+        // What this test can prove: the id is present, not the nil sentinel,
+        // and freshly chosen per call. What it cannot prove: that the id is
+        // not read from disk — `send_spawn_options` takes no config and no
+        // state dir, so it has no way to read one. That is structural, and a
+        // future change that adds a `&ClientConfig` parameter here should be
+        // read as a red flag rather than a refactor.
+        let options = send_spawn_options();
+        let device = options.device.expect("send must always name a device");
+        assert!(!device.is_nil(), "a nil device id is not an identity");
+
+        let second = send_spawn_options();
+        assert_ne!(
+            second.device,
+            Some(device),
+            "each send gets its own ephemeral id, or concurrent sends collide"
+        );
+    }
+
+    #[test]
+    fn the_send_subcommand_advertises_no_capabilities() {
+        // Same rule as the long-lived client (4.4): no pull path yet, so
+        // claiming `lazy-file` would invite offers this build drops.
+        let options = send_spawn_options();
+        assert!(options.caps.is_empty(), "{:?}", options.caps.tokens());
+    }
+
+    #[test]
+    fn throttle_is_per_file_not_per_state() {
+        // The bug this replaces: `Hashing` was never throttled, so a large file
+        // produced ~101 lines. Now every state shares one interval per file.
+        let now = Instant::now();
+        let e = event(ProgressState::Hashing, 5);
+        assert!(
+            !should_log_progress(Some(last(now, ProgressState::Hashing)), &e, now),
+            "a second Hashing event inside the interval must be dropped"
+        );
+        assert!(
+            should_log_progress(
+                Some(last(now - Duration::from_secs(1), ProgressState::Hashing)),
+                &e,
+                now
+            ),
+            "one line per second is allowed"
+        );
+    }
+
+    #[test]
+    fn first_event_always_logs() {
+        let e = event(ProgressState::Pulling, 1);
+        assert!(should_log_progress(None, &e, Instant::now()));
+    }
+
+    #[test]
+    fn state_change_logs_immediately() {
+        let now = Instant::now();
+        let e = event(ProgressState::Pulling, 50);
+        assert!(
+            should_log_progress(Some(last(now, ProgressState::Hashing)), &e, now),
+            "hashing → pulling is the interesting moment, not a percentage"
+        );
+    }
+
+    #[test]
+    fn terminal_states_always_log() {
+        let now = Instant::now();
+        for state in [
+            ProgressState::Done,
+            ProgressState::Failed,
+            ProgressState::Aborted,
+        ] {
+            let e = event(state, 100);
+            assert!(
+                should_log_progress(Some(last(now, state)), &e, now),
+                "{state:?} must always print, even twice in a row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sub_second_hashing_burst_collapses_to_one_line() {
+        // Sanity: the decision function is pure, so 101 Hashing events inside
+        // one second collapse to a single line.
+        let start = Instant::now();
+        let mut printed = 0;
+        let mut previous: Option<LastLogLine> = None;
+        for i in 0..101u64 {
+            let now = start + Duration::from_millis(i * 5); // 505 ms total
+            let e = event(ProgressState::Hashing, i);
+            if should_log_progress(previous, &e, now) {
+                printed += 1;
+                previous = Some(last(now, ProgressState::Hashing));
+            }
+        }
+        assert_eq!(printed, 1, "a sub-second Hashing burst is one line");
+    }
 }

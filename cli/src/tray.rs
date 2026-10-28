@@ -28,11 +28,14 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 
 use anyhow::{Context, Result};
-use clipboardwire_core::client::{ClientConfig, ClientStatus};
+use clipboardwire_core::client::{
+    ClientConfig, ClientStatus, ProgressState, TransferId, TransferProgress,
+};
 use clipboardwire_core::server::hub::HubStatsSink;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::runtime::{Handle, Runtime};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 #[cfg(windows)]
@@ -53,8 +56,9 @@ enum UserEvent {
     /// automatic reload of the config + restart of running tasks.
     SettingsExited,
     /// The client transport reported a connection-state transition for
-    /// the supervisor identified by `generation`. Stale events from
-    /// previous-generation supervisors are filtered out at the loop.
+    /// the supervisor identified by `generation`. If that supervisor is no
+    /// longer the live one — exited, aborted, or never started — the event is
+    /// dropped; see [`is_live_supervisor_event`].
     ClientStatusChanged {
         generation: u64,
         status: ClientStatus,
@@ -67,6 +71,15 @@ enum UserEvent {
     /// poll. The handler just calls `refresh_tooltip`, which reads
     /// the live count straight from `state.hub_stats`.
     HubPeerCountChanged,
+    /// One transfer reported progress for the supervisor identified by
+    /// `generation`. Stale events are dropped at the loop, exactly like
+    /// `ClientStatusChanged`: the old subscriber can still have events
+    /// buffered when a reload swaps supervisors, and replaying them would
+    /// resurrect transfers from the previous generation.
+    TransferProgress {
+        generation: u64,
+        progress: Box<TransferProgress>,
+    },
 }
 
 /// How often the background task re-checks the system theme. 5 s is
@@ -80,6 +93,73 @@ const THEME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// measurable cost.
 const HUB_STATS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a finished transfer stays visible in the menu before it is
+/// dropped. Long enough to read "sent report.pdf", short enough that the menu
+/// returns to its normal size.
+const TRANSFER_RETENTION: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long an **active** transfer may go without an event before the tray
+/// gives up on it.
+///
+/// This is a presentation backstop, not a transfer timeout: the transfer itself
+/// is still governed by the transport. It exists because an entry is otherwise
+/// only removable by its own terminal event, so a wedged supervisor leaves
+/// "sending 12%" on screen indefinitely.
+///
+/// This is the floor. `Hashing` gets a longer window scaled to the file size
+/// (see [`stall_grace`]): the sender reports hash progress once per percent, so
+/// the gap between two events is 1 % of the file's read time — on slow or
+/// network-backed media that legitimately exceeds a minute for a large file.
+/// Pulling keeps this value: one chunk is 4 MiB, so a minute of silence means
+/// the stream really has stopped, and a resumed transfer re-adds its entry on
+/// the next event.
+const TRANSFER_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Slowest hashing throughput still treated as healthy, used to scale the
+/// `Hashing` stall window. 1 MiB/s is well below any disk that can finish a
+/// multi-gigabyte file in a useful time, so a healthy transfer keeps its entry.
+const HASH_STALL_MIN_RATE_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// Ceiling for the size-scaled `Hashing` window.
+///
+/// Without it, a 1 TB file would earn a multi-hour window and the backstop
+/// would never fire. Half an hour of silence during a pre-hash is enough to
+/// conclude the process is wedged rather than slow.
+const TRANSFER_STALL_MAX: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Capacity of the per-generation progress channel. A chunk is one event, so
+/// this only needs to absorb a short burst; a lagging tray skips ahead rather
+/// than blocking the transfer.
+const TRANSFER_PROGRESS_BUF: usize = 64;
+
+/// Menu slots for transfer detail. A larger concurrent fan-out still shows an
+/// aggregate count in the tooltip; the menu just lists the first few.
+const MAX_TRANSFER_MENU_ITEMS: usize = 4;
+
+/// Hard ceiling for the whole tooltip, in characters (`szTip` is 128).
+const TOOLTIP_MAX_CHARS: usize = 128;
+
+/// Character budget for the transfer line appended to the tooltip.
+///
+/// `NOTIFYICONDATAW.szTip` is 128 UTF-16 code units, and the existing tooltip
+/// already spends ~60 on the status line, server URL and hub peer count. 56
+/// leaves headroom for the worst case (`clipboardwire — disconnected,
+/// retrying in 60s` + URL + `\nhub running (64 clients connected)`).
+const TOOLTIP_TRANSFER_BUDGET: usize = 56;
+
+/// Key for one transfer row.
+///
+/// `file_id` alone is not unique under lazy transfer: the same file can be
+/// pasted twice concurrently, producing two `transfer_id`s. Keying on the pair
+/// keeps those rows apart, while an eager transfer (`transfer_id: None`) still
+/// collapses to one row per file as before.
+///
+/// The `Option` is not a wart to be normalised away. An eager transfer has no
+/// session, so there is nothing to disambiguate it with — and two eager
+/// transfers of one `file_id` cannot happen, because eager mode sends a file
+/// once per paste rather than once per pull.
+type TransferKey = (TransferId, Option<TransferId>);
+
 /// Tray-level handles that need to outlive a Reload event.
 struct State {
     supervisor: Option<JoinHandle<Result<()>>>,
@@ -87,6 +167,23 @@ struct State {
     /// Last status reported by the current-generation supervisor.
     /// `None` when no supervisor is running (e.g. needs-config).
     client_status: Option<ClientStatus>,
+    /// Live transfer progress, one entry per [`TransferKey`], in arrival order.
+    ///
+    /// Updated from the event loop only: the broadcast subscriber runs as a
+    /// tokio task that posts `UserEvent::TransferProgress`, so nothing here is
+    /// touched from a background thread.
+    transfers: Vec<TransferProgress>,
+    /// When each listed transfer should be dropped, keyed like `transfers`.
+    ///
+    /// Two rules share this table:
+    ///
+    /// - a terminal event schedules a clear 3 s later, so the menu shows "sent
+    ///   report.pdf" briefly and then returns to normal size;
+    /// - an **active** transfer is rescheduled for [`TRANSFER_STALL_TIMEOUT`]
+    ///   after every event. If the supervisor wedges — or a `Failed`/`Done`
+    ///   event is lost — the entry still disappears instead of hanging at
+    ///   "sending 12%" forever.
+    transfer_clear_at: Vec<(TransferKey, std::time::Instant)>,
     /// The embedded hub spawned from `[hub]` in the client config.
     embedded_hub: Option<JoinHandle<Result<()>>>,
     embedded_hub_gen: u64,
@@ -109,6 +206,101 @@ struct State {
     /// it; this is just for "is one running" checks.
     settings_alive: bool,
     cfg: Option<ClientConfig>,
+}
+
+impl State {
+    /// Fold one progress event into the transfer list.
+    ///
+    /// One entry per [`TransferKey`] — `(file_id, transfer_id)`, not `file_id`
+    /// — so a newer event replaces the previous one for *that* transfer while
+    /// a concurrent transfer of the same file keeps its own row.
+    ///
+    /// Every event reschedules the entry's removal: terminal states get
+    /// [`TRANSFER_RETENTION`], active ones [`TRANSFER_STALL_TIMEOUT`]. The
+    /// latter is the backstop for a wedged supervisor — without it an entry
+    /// whose terminal event never arrives stays on screen until quit.
+    fn record_progress(&mut self, event: TransferProgress) {
+        let now = std::time::Instant::now();
+        let deadline = if event.state.is_terminal() {
+            now + TRANSFER_RETENTION
+        } else {
+            now + stall_grace(event.state, event.bytes_total)
+        };
+        let key: TransferKey = (event.file_id, event.transfer_id);
+        match self
+            .transfers
+            .iter_mut()
+            .find(|t| (t.file_id, t.transfer_id) == key)
+        {
+            Some(existing) => *existing = event.clone(),
+            None => self.transfers.push(event.clone()),
+        }
+        self.transfer_clear_at.retain(|(k, _)| *k != key);
+        self.transfer_clear_at.push((key, deadline));
+    }
+
+    /// Drop transfers whose retention or stall window has passed. Returns
+    /// whether anything changed.
+    fn expire_transfers(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let expired: Vec<TransferKey> = self
+            .transfer_clear_at
+            .iter()
+            .filter(|(_, at)| *at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        if expired.is_empty() {
+            return false;
+        }
+        self.transfer_clear_at
+            .retain(|(key, _)| !expired.contains(key));
+        self.transfers
+            .retain(|t| !expired.contains(&(t.file_id, t.transfer_id)));
+        true
+    }
+
+    /// Earliest pending removal deadline (retention or stall), for the
+    /// event-loop wake-up.
+    fn next_transfer_deadline(&self) -> Option<std::time::Instant> {
+        self.transfer_clear_at.iter().map(|(_, at)| *at).min()
+    }
+}
+
+/// How long an active transfer in `state` may stay silent before it is dropped.
+///
+/// [`TRANSFER_STALL_TIMEOUT`] is enough for `Pulling`, where one chunk is 4 MiB
+/// and a live stream reports every few milliseconds on any usable link. It is
+/// **not** enough for `Hashing`: the sender emits one event per percent, so the
+/// silent gap is 1 % of the time needed to read the whole file.
+///
+/// Concretely, a 100 GB file at a sustained 200 MB/s emits an event every ~5 s;
+/// the same file on a slow USB 2 disk (~30 MB/s) emits one every ~33 s; on a
+/// degraded network mount it can exceed a minute. The entry would then vanish
+/// mid-hash and reappear at the next percent — a flicker the user reads as a
+/// failed transfer.
+///
+/// So `Hashing` gets a window sized for the *slowest plausible read*: assume
+/// [`HASH_STALL_MIN_RATE_BYTES_PER_SEC`], which makes the expected gap
+/// `bytes_total / 100 / rate`. That is clamped to
+/// `TRANSFER_STALL_TIMEOUT..=TRANSFER_STALL_MAX`, so small files keep the plain
+/// minute and absurd sizes cannot disable the backstop.
+///
+/// This deliberately does not use "time since `bytes_done` last changed": that
+/// would be wrong for `Hashing`, where the percentage *is* the progress and a
+/// slow percent step is exactly the state being defended against. Silence, not
+/// a flat byte count, is the signal.
+fn stall_grace(state: ProgressState, bytes_total: u64) -> std::time::Duration {
+    match state {
+        ProgressState::Hashing => {
+            // One percent of the file, read at the healthy-floor rate. Integer
+            // division is fine: the result is a duration in whole seconds.
+            let percent_bytes = (bytes_total / 100).max(1);
+            let secs = percent_bytes / HASH_STALL_MIN_RATE_BYTES_PER_SEC;
+            let scaled = std::time::Duration::from_secs(secs);
+            scaled.clamp(TRANSFER_STALL_TIMEOUT, TRANSFER_STALL_MAX)
+        }
+        _ => TRANSFER_STALL_TIMEOUT,
+    }
 }
 
 /// Enter the tray UI, taking the main thread for the OS event loop.
@@ -143,6 +335,15 @@ pub fn run(
     let hub_info_item = MenuItem::new("", false, None);
     hub_info_item.set_enabled(false);
     let sep0 = PredefinedMenuItem::separator();
+    // Per-transfer detail lives in the menu, never in the tooltip: `szTip` is
+    // 128 characters and already carries status, URL and peer count. A fixed
+    // pool of disabled items is reused, so the menu does not rebuild while a
+    // multi-file copy runs.
+    let transfer_header_item = MenuItem::new("", false, None);
+    transfer_header_item.set_enabled(false);
+    let transfer_items: Vec<MenuItem> = (0..MAX_TRANSFER_MENU_ITEMS)
+        .map(|_| MenuItem::new("", false, None))
+        .collect();
     let edit_item = MenuItem::new("Edit config…", true, None);
     let reload_item = MenuItem::new("Reload config", true, None);
     let sep1 = PredefinedMenuItem::separator();
@@ -161,6 +362,10 @@ pub fn run(
     menu.append(&status_item)?;
     menu.append(&server_item)?;
     menu.append(&hub_info_item)?;
+    menu.append(&transfer_header_item)?;
+    for item in &transfer_items {
+        menu.append(item)?;
+    }
     menu.append(&sep0)?;
     menu.append(&edit_item)?;
     menu.append(&reload_item)?;
@@ -236,6 +441,8 @@ pub fn run(
         supervisor: None,
         supervisor_gen: 0,
         client_status: None,
+        transfers: Vec::new(),
+        transfer_clear_at: Vec::new(),
         embedded_hub: None,
         embedded_hub_gen: 0,
         hub_bind_error: None,
@@ -270,7 +477,20 @@ pub fn run(
 
     let mut theme = theme;
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // Retire finished transfers whose retention window has passed. Done
+        // before dispatch so `WaitUntil` wake-ups (which carry no user event)
+        // and ordinary events both get the cleanup, and no arm can shadow
+        // another by matching here.
+        if state.expire_transfers() {
+            update_transfer_items(&transfer_header_item, &transfer_items, &state);
+            refresh_tooltip(&tray, &state, &config_path);
+        }
+        // Wait, unless a finished transfer is due to disappear: then wake up at
+        // that instant instead of leaving a stale entry on screen forever.
+        *control_flow = match state.next_transfer_deadline() {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        };
 
         match event {
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
@@ -357,9 +577,14 @@ pub fn run(
             Event::UserEvent(UserEvent::SupervisorExited {
                 generation,
                 summary,
-            }) if Some(generation) == current_supervisor_gen(&state) => {
+            }) if is_live_supervisor_event(&state, generation) => {
                 state.supervisor = None;
                 state.client_status = None;
+                // A dead supervisor has no live transfers; do not keep showing
+                // stale percentages.
+                state.transfers.clear();
+                state.transfer_clear_at.clear();
+                update_transfer_items(&transfer_header_item, &transfer_items, &state);
                 warn!(
                     gen = generation,
                     summary, "supervisor exited on its own; staying in tray"
@@ -380,13 +605,21 @@ pub fn run(
                 update_hub_info_item(&hub_info_item, &state);
                 refresh_tooltip(&tray, &state, &config_path);
             }
+            Event::UserEvent(UserEvent::TransferProgress {
+                generation,
+                progress,
+            }) if is_live_supervisor_event(&state, generation) => {
+                state.record_progress(*progress);
+                update_transfer_items(&transfer_header_item, &transfer_items, &state);
+                refresh_tooltip(&tray, &state, &config_path);
+            }
             Event::UserEvent(UserEvent::ThemeChanged(new_theme)) => {
                 info!(?new_theme, "system theme changed; refreshing tray icon");
                 theme = new_theme;
                 refresh_icon(&tray, theme, &state);
             }
             Event::UserEvent(UserEvent::ClientStatusChanged { generation, status })
-                if generation == state.supervisor_gen =>
+                if is_live_supervisor_event(&state, generation) =>
             {
                 state.client_status = Some(status);
                 update_status_item(&status_item, &state);
@@ -416,6 +649,27 @@ fn current_supervisor_gen(state: &State) -> Option<u64> {
     state.supervisor.as_ref().map(|_| state.supervisor_gen)
 }
 
+/// Whether an event tagged with `generation` belongs to the supervisor
+/// currently running.
+///
+/// Every supervisor-scoped event (`SupervisorExited`, `ClientStatusChanged`,
+/// `TransferProgress`) uses this one predicate. It deliberately tests **both**
+/// the generation *and* that a supervisor is still installed:
+///
+/// - Generation alone is not enough. `abort_running` bumps the generation, so
+///   an old forwarder's buffered events no longer match — but the window
+///   between `abort_running` and the replacement in `apply_loaded_config` has
+///   no supervisor at all, and an event from a forwarder that has not noticed
+///   yet would otherwise be applied to a tray that is showing "not connected".
+/// - Liveness alone is not enough either: a fresh generation's forwarder can
+///   race with a reload.
+///
+/// Dropping is always the safe direction: status and progress are advisory, and
+/// anything the new supervisor cares about it will report again.
+fn is_live_supervisor_event(state: &State, generation: u64) -> bool {
+    current_supervisor_gen(state) == Some(generation)
+}
+
 fn current_hub_gen(state: &State) -> Option<u64> {
     state.embedded_hub.as_ref().map(|_| state.embedded_hub_gen)
 }
@@ -432,6 +686,19 @@ fn abort_running(state: &mut State) {
     state.client_status = None;
     state.hub_bind_error = None;
     state.hub_stats = None;
+    // Retire the generation *before* clearing the list. A forwarder task that
+    // outlives `abort()` can still deliver events already buffered in the
+    // broadcast channel; without this bump they would pass the
+    // `generation == state.supervisor_gen` guard and repopulate the entries we
+    // are about to drop. `apply_loaded_config` normally bumps the generation
+    // itself, but it returns early when the reloaded config is invalid — which
+    // is exactly when this increment is the only one that happens.
+    state.supervisor_gen = state.supervisor_gen.wrapping_add(1);
+    // Transfers belong to the supervisor that just got aborted. Their
+    // terminal events will never arrive, so leaving them would pin a zombie
+    // "receiving 33%" in the tooltip until the process exits.
+    state.transfers.clear();
+    state.transfer_clear_at.clear();
     if let Some(p) = state.hub_stats_poller.take() {
         p.abort();
     }
@@ -507,10 +774,49 @@ fn apply_loaded_config(
         }
     });
 
+    // Progress: the channel is created HERE, not inside `run_with_status` —
+    // the tray spawns the supervisor itself, so an internally-created channel
+    // would have no receiver (design §9). Every supervisor generation gets its
+    // own channel; the old subscriber exits when this one drops.
+    let (progress_tx, mut progress_rx) =
+        broadcast::channel::<TransferProgress>(TRANSFER_PROGRESS_BUF);
+    let proxy_for_progress = proxy.clone();
+    let progress_gen = gen;
+    handle.spawn(async move {
+        // `lagged` means the tray fell behind; progress is advisory, so skip to
+        // the newest events instead of tearing the subscription down.
+        loop {
+            match progress_rx.recv().await {
+                Ok(event) => {
+                    // Tag with the generation this subscriber was created for,
+                    // so the loop can drop events that outlive their supervisor.
+                    if proxy_for_progress
+                        .send_event(UserEvent::TransferProgress {
+                            generation: progress_gen,
+                            progress: Box::new(event),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "tray lagged behind transfer progress events");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+
     let proxy_clone = proxy.clone();
     let client_cfg_for_log = client_cfg.clone();
     let sup = handle.spawn(async move {
-        let result = clipboardwire_core::client::run_with_status(client_cfg, Some(status_tx)).await;
+        let result = clipboardwire_core::client::run_with_status(
+            client_cfg,
+            Some(status_tx),
+            Some(progress_tx),
+        )
+        .await;
         let summary = match &result {
             Ok(()) => "clean exit".to_string(),
             Err(e) => format!("{e:#}"),
@@ -783,13 +1089,17 @@ fn friendly_bind_error(e: &anyhow::Error) -> String {
 fn refresh_tooltip(tray: &TrayIcon, state: &State, config_path: &Path) {
     // Hub bind failure wins the tooltip — it's the actionable problem.
     if let Some(err) = &state.hub_bind_error {
-        let _ = tray.set_tooltip(Some(format!(
-            "clipboardwire — hub bind failed ({err})\n{}",
-            config_path.display()
-        )));
+        let tip = compose_tooltip(
+            &[
+                format!("clipboardwire — hub bind failed ({err})"),
+                config_path.display().to_string(),
+            ],
+            None,
+        );
+        let _ = tray.set_tooltip(Some(tip));
         return;
     }
-    let mut tip = match (&state.cfg, state.client_status) {
+    let status_line = match (&state.cfg, state.client_status) {
         (None, _) => format!(
             "clipboardwire — needs config (right-click → Edit config)\n{}",
             config_path.display()
@@ -807,14 +1117,172 @@ fn refresh_tooltip(tray: &TrayIcon, state: &State, config_path: &Path) {
             cfg.server
         ),
     };
+    let mut lines: Vec<String> = status_line.split('\n').map(str::to_string).collect();
     // Append the embedded-hub peer count when the hub is running.
     // Count includes our own loopback supervisor (the hub treats it
     // as a peer like any other), so a freshly-started embedded hub
     // with no remote peers shows "1 client".
     if let Some(stats) = &state.hub_stats {
-        tip.push_str(&format_hub_peer_line(stats.current()));
+        lines.push(
+            format_hub_peer_line(stats.current())
+                .trim_start_matches('\n')
+                .to_string(),
+        );
     }
+    let transfer_line = format_transfer_tooltip_line(&state.transfers);
+    let tip = compose_tooltip(&lines, transfer_line.as_deref());
     let _ = tray.set_tooltip(Some(tip));
+}
+
+/// Assemble the tooltip and guarantee it fits [`TOOLTIP_MAX_CHARS`].
+///
+/// `NOTIFYICONDATAW.szTip` is 128 UTF-16 code units; a longer string is
+/// silently truncated by the shell, usually mid-URL. This function decides what
+/// to sacrifice instead: the transfer line keeps its own budget, the middle
+/// lines (URL, peer count) are shortened, and the first line — the status — is
+/// only touched if nothing else is left.
+fn compose_tooltip(lines: &[String], transfer_line: Option<&str>) -> String {
+    // The transfer line is the newest information, so it is reserved first.
+    let transfer = transfer_line.map(|l| fit_chars(l, TOOLTIP_TRANSFER_BUDGET));
+    let reserved = transfer.as_ref().map_or(0, |l| l.chars().count() + 1);
+    let budget = TOOLTIP_MAX_CHARS.saturating_sub(reserved);
+
+    let mut kept: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let used: usize = kept.iter().map(|l| l.chars().count() + 1).sum();
+        let remaining = budget.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let need = line.chars().count();
+        if need <= remaining {
+            kept.push(line.clone());
+        } else if i == 0 {
+            // Never drop the status line entirely; shorten it.
+            kept.push(fit_chars(line, remaining));
+            break;
+        } else {
+            // A middle line: keep as much as fits, then stop. Better a short
+            // URL than a clipped status or a missing transfer.
+            if remaining > 8 {
+                kept.push(fit_chars(line, remaining));
+            }
+            break;
+        }
+    }
+
+    let mut out = kept.join("\n");
+    if let Some(line) = transfer {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
+    // Belt and braces: the arithmetic above should already bound this.
+    fit_chars(&out, TOOLTIP_MAX_CHARS)
+}
+
+/// One aggregate line describing live transfers, or `None` when there are none.
+///
+/// Kept deliberately terse: `szTip` is 128 chars and the status/URL/peer lines
+/// already use most of it. Detail per transfer lives in the menu instead. The
+/// line is capped at [`TOOLTIP_TRANSFER_BUDGET`] characters, so five concurrent
+/// transfers still fit ("2 transfers active, 45%").
+fn format_transfer_tooltip_line(transfers: &[TransferProgress]) -> Option<String> {
+    if transfers.is_empty() {
+        return None;
+    }
+    let active: Vec<&TransferProgress> = transfers
+        .iter()
+        .filter(|t| !t.state.is_terminal())
+        .collect();
+    let line = if active.is_empty() {
+        // Everything finished: say so once, briefly, until retention expires.
+        match transfers.len() {
+            1 => transfers[0].summary_line(24),
+            n => format!("{n} transfers finished"),
+        }
+    } else if active.len() == 1 {
+        active[0].summary_line(TOOLTIP_TRANSFER_BUDGET)
+    } else {
+        let pct = aggregate_percent(&active);
+        match pct {
+            Some(p) => format!("{} transfers active, {p}%", active.len()),
+            None => format!("{} transfers active", active.len()),
+        }
+    };
+    Some(fit_chars(&line, TOOLTIP_TRANSFER_BUDGET))
+}
+
+/// Bytes-weighted completion across `transfers`, or `None` if no total is
+/// known (e.g. every event is still `Hashing` at 0 of an unknown size).
+fn aggregate_percent(transfers: &[&TransferProgress]) -> Option<u64> {
+    let total: u64 = transfers.iter().map(|t| t.bytes_total).sum();
+    if total == 0 {
+        return None;
+    }
+    let done: u64 = transfers
+        .iter()
+        .map(|t| t.bytes_done.min(t.bytes_total))
+        .sum();
+    Some(done * 100 / total)
+}
+
+/// Truncate to `max` characters, appending `…` when cut.
+fn fit_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Fill the transfer section of the menu.
+///
+/// The header names the count; each slot lists one transfer. Empty slots are
+/// blanked rather than hidden, because adding/removing menu items on every
+/// chunk event makes some platforms flicker.
+fn update_transfer_items(header: &MenuItem, items: &[MenuItem], state: &State) {
+    if state.transfers.is_empty() {
+        header.set_text("");
+    } else {
+        header.set_text(format_transfer_header(&state.transfers));
+    }
+    for (slot, item) in items.iter().enumerate() {
+        match state.transfers.get(slot) {
+            Some(t) => item.set_text(format!("  {}", t.summary_line(40))),
+            None => item.set_text(""),
+        }
+    }
+}
+
+/// Header text for the transfer section.
+///
+/// A failure is not a completion: counting it under "done" hides the only
+/// signal the user gets that a transfer died.
+fn format_transfer_header(transfers: &[TransferProgress]) -> String {
+    let active = transfers.iter().filter(|t| !t.state.is_terminal()).count();
+    match active {
+        0 => {
+            let done = transfers
+                .iter()
+                .filter(|t| t.state == ProgressState::Done)
+                .count();
+            let failed = transfers
+                .iter()
+                .filter(|t| t.state == ProgressState::Failed)
+                .count();
+            match (done, failed) {
+                (0, 0) => format!("Transfers ({})", transfers.len()),
+                (d, 0) => format!("Transfers ({d} done)"),
+                (0, f) => format!("Transfers ({f} failed)"),
+                (d, f) => format!("Transfers ({d} done, {f} failed)"),
+            }
+        }
+        1 => "Transfer in progress".to_string(),
+        n => format!("Transfers in progress ({n})"),
+    }
 }
 
 /// Render the per-peer-count suffix that gets appended to the
@@ -928,6 +1396,450 @@ fn draw_status_dot(rgba: &mut image::RgbaImage, width: u32, height: u32, color: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clipboardwire_core::client::{Direction, ProgressState};
+
+    fn progress(name: &str, state: ProgressState, done: u64, total: u64) -> TransferProgress {
+        progress_for(
+            TransferId::from_u128(done as u128 + 1),
+            name,
+            state,
+            done,
+            total,
+        )
+    }
+
+    fn progress_for(
+        file_id: TransferId,
+        name: &str,
+        state: ProgressState,
+        done: u64,
+        total: u64,
+    ) -> TransferProgress {
+        TransferProgress {
+            file_id,
+            transfer_id: None,
+            direction: Direction::Send,
+            peer: None,
+            name: name.to_string(),
+            bytes_done: done,
+            bytes_total: total,
+            state,
+        }
+    }
+
+    /// Worst realistic tooltip: long URL, disconnected status, full hub, plus
+    /// the transfer line. `NOTIFYICONDATAW.szTip` is 128 UTF-16 code units.
+    #[test]
+    fn tooltip_stays_within_the_platform_limit() {
+        let lines = vec![
+            "clipboardwire — disconnected, retrying in 60s".to_string(),
+            "wss://some-long-server-name.example.lan:8484/sync".to_string(),
+            format_hub_peer_line(64)
+                .trim_start_matches('\n')
+                .to_string(),
+        ];
+        for transfers in [
+            vec![progress("a.bin", ProgressState::Pulling, 42, 100)],
+            vec![
+                progress("a.bin", ProgressState::Pulling, 10, 100),
+                progress("b.bin", ProgressState::Pulling, 20, 100),
+                progress("c.bin", ProgressState::Pulling, 30, 100),
+                progress("d.bin", ProgressState::Pulling, 40, 100),
+                progress("e.bin", ProgressState::Pulling, 50, 100),
+            ],
+            vec![progress(
+                "a-really-long-file-name-that-could-blot-out-the-whole-tooltip.tar.gz",
+                ProgressState::Pulling,
+                1,
+                1000,
+            )],
+        ] {
+            let line = format_transfer_tooltip_line(&transfers).expect("line for live transfers");
+            let full = compose_tooltip(&lines, Some(&line));
+            assert!(
+                full.chars().count() <= TOOLTIP_MAX_CHARS,
+                "tooltip is {} chars: {full:?}",
+                full.chars().count()
+            );
+            assert!(
+                line.chars().count() <= TOOLTIP_TRANSFER_BUDGET,
+                "transfer line is {} chars: {line:?}",
+                line.chars().count()
+            );
+            // The transfer line must survive assembly; only the middle lines
+            // may be shortened.
+            assert!(
+                full.ends_with(&line),
+                "transfer line was dropped: {full:?} does not end with {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_transfer_line_is_aggregate_when_several_run() {
+        let transfers = vec![
+            progress("a.bin", ProgressState::Pulling, 10, 100),
+            progress("b.bin", ProgressState::Pulling, 20, 100),
+        ];
+        let line = format_transfer_tooltip_line(&transfers).unwrap();
+        assert_eq!(line, "2 transfers active, 15%");
+        // No individual names: detail belongs in the menu, not the tooltip.
+        assert!(!line.contains("a.bin"));
+    }
+
+    #[test]
+    fn tooltip_transfer_line_names_a_single_transfer() {
+        let line = format_transfer_tooltip_line(&[progress(
+            "report.pdf",
+            ProgressState::Pulling,
+            42,
+            100,
+        )])
+        .unwrap();
+        assert_eq!(line, "sending report.pdf 42%");
+    }
+
+    #[test]
+    fn tooltip_has_no_transfer_line_when_idle() {
+        assert_eq!(format_transfer_tooltip_line(&[]), None);
+    }
+
+    #[test]
+    fn finished_transfers_are_retained_then_expired() {
+        let mut state = empty_state();
+
+        let id = TransferId::from_u128(7);
+        state.record_progress(progress_for(id, "a.bin", ProgressState::Pulling, 10, 100));
+        assert_eq!(state.transfers.len(), 1);
+        // An active transfer is not immortal: it carries the stall backstop.
+        let stall = state
+            .next_transfer_deadline()
+            .expect("stall deadline armed");
+        let until_stall = stall.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            until_stall <= TRANSFER_STALL_TIMEOUT && until_stall > TRANSFER_STALL_TIMEOUT / 2,
+            "expected a {TRANSFER_STALL_TIMEOUT:?} stall window, got {until_stall:?}"
+        );
+
+        state.record_progress(progress_for(id, "a.bin", ProgressState::Done, 100, 100));
+        assert_eq!(
+            state.transfers.len(),
+            1,
+            "a Done event replaces, not appends"
+        );
+        assert!(
+            state.next_transfer_deadline().is_some(),
+            "Done must arm the retention timer"
+        );
+
+        // Deadline is ~3 s out.
+        let deadline = state.next_transfer_deadline().unwrap();
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining <= TRANSFER_RETENTION && remaining > TRANSFER_RETENTION / 2,
+            "retention window looks wrong: {remaining:?}"
+        );
+
+        // Nothing expires before the window closes.
+        assert!(!state.expire_transfers());
+        assert_eq!(state.transfers.len(), 1);
+    }
+
+    fn empty_state() -> State {
+        State {
+            supervisor: None,
+            supervisor_gen: 0,
+            client_status: None,
+            transfers: Vec::new(),
+            transfer_clear_at: Vec::new(),
+            embedded_hub: None,
+            embedded_hub_gen: 0,
+            hub_bind_error: None,
+            hub_stats: None,
+            hub_stats_poller: None,
+            settings_alive: false,
+            cfg: None,
+        }
+    }
+
+    #[test]
+    fn stalled_transfer_is_dropped_without_a_terminal_event() {
+        // Backstop for a wedged supervisor: no Done/Failed ever arrives, so the
+        // entry must still disappear once the stall window passes.
+        let mut state = empty_state();
+        let id = TransferId::from_u128(11);
+        state.record_progress(progress_for(
+            id,
+            "stuck.bin",
+            ProgressState::Pulling,
+            12,
+            100,
+        ));
+        assert_eq!(state.transfers.len(), 1);
+
+        // Active transfers expire on the stall window, not the 3 s retention.
+        let deadline = state.next_transfer_deadline().unwrap();
+        assert!(
+            deadline.saturating_duration_since(std::time::Instant::now()) > TRANSFER_RETENTION,
+            "an active transfer must not be dropped on the retention timer"
+        );
+        assert!(!state.expire_transfers(), "nothing should expire yet");
+        assert_eq!(state.transfers.len(), 1);
+    }
+
+    #[test]
+    fn hashing_a_large_file_survives_the_plain_stall_window() {
+        // Path A. The sender reports hash progress once per percent, so on a
+        // slow read the gap between two `Hashing` events is 1 % of the whole
+        // read time. A 100 GB file at ~30 MB/s (slow external disk) leaves
+        // ~33 s between events — inside 60 s. A network mount an order of
+        // magnitude slower does not, and that is the case this guards: the
+        // entry must stay put rather than blink out mid-hash.
+        let mut state = empty_state();
+        let id = TransferId::from_u128(41);
+        let total = 100 * 1024 * 1024 * 1024; // 100 GiB
+        state.record_progress(progress_for(
+            id,
+            "huge.bin",
+            ProgressState::Hashing,
+            0,
+            total,
+        ));
+
+        let grace = state
+            .next_transfer_deadline()
+            .expect("hashing must arm a deadline")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            grace > TRANSFER_STALL_TIMEOUT,
+            "a 100 GiB hash needs more than the plain window, got {grace:?}"
+        );
+        // 1 % of 100 GiB is ~1 GiB; at the 1 MiB/s floor that is ~1024 s.
+        assert!(grace >= std::time::Duration::from_secs(1000), "{grace:?}");
+
+        // Sixty-five seconds of silence — enough to trip the plain window —
+        // must not retire it.
+        assert!(
+            !state.expire_transfers(),
+            "a slow but healthy hash must not be dropped"
+        );
+        assert_eq!(state.transfers.len(), 1);
+
+        // The backstop is still armed: the window is finite and bounded.
+        assert!(grace <= TRANSFER_STALL_MAX, "{grace:?}");
+    }
+
+    #[test]
+    fn pulling_keeps_the_plain_stall_window() {
+        // Path B — and the counterweight to `Hashing`. Pulling reports every
+        // chunk (4 MiB), so a minute of silence is not slowness: the stream has
+        // stopped and the entry should go. Without this asymmetry a size-scaled
+        // window would apply to every state and the backstop would stop firing.
+        for total in [100u64, 1024 * 1024, 100 * 1024 * 1024 * 1024] {
+            let grace = stall_grace(ProgressState::Pulling, total);
+            assert_eq!(
+                grace, TRANSFER_STALL_TIMEOUT,
+                "pulling must not scale with size (total={total})"
+            );
+        }
+        assert_eq!(
+            stall_grace(ProgressState::Verifying, 100 * 1024 * 1024 * 1024),
+            TRANSFER_STALL_TIMEOUT,
+            "verifying is a single re-read plus a hash; it keeps the plain window"
+        );
+    }
+
+    #[test]
+    fn hashing_grace_is_clamped_at_both_ends() {
+        // Small files: the scaled window is below the floor, so it stays at 60 s.
+        assert_eq!(
+            stall_grace(ProgressState::Hashing, 1024),
+            TRANSFER_STALL_TIMEOUT,
+            "a 1 KiB file must not get a sub-minute window"
+        );
+        // A zero total (metadata unavailable) must not produce a 0 s window.
+        assert_eq!(
+            stall_grace(ProgressState::Hashing, 0),
+            TRANSFER_STALL_TIMEOUT
+        );
+        // Absurd sizes: clamped, so the backstop still fires eventually.
+        assert_eq!(
+            stall_grace(ProgressState::Hashing, u64::MAX),
+            TRANSFER_STALL_MAX
+        );
+    }
+
+    #[test]
+    fn every_event_reschedules_the_stall_deadline() {
+        // A transfer that keeps reporting must not be retired mid-transfer:
+        // the deadline moves forward with each event.
+        let mut state = empty_state();
+        let id = TransferId::from_u128(12);
+        state.record_progress(progress_for(
+            id,
+            "slow.bin",
+            ProgressState::Pulling,
+            10,
+            100,
+        ));
+        let first = state.next_transfer_deadline().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        state.record_progress(progress_for(
+            id,
+            "slow.bin",
+            ProgressState::Pulling,
+            20,
+            100,
+        ));
+        let second = state.next_transfer_deadline().unwrap();
+        assert!(second > first, "each event must push the deadline out");
+    }
+
+    #[test]
+    fn terminal_event_shortens_the_deadline_to_retention() {
+        let mut state = empty_state();
+        let id = TransferId::from_u128(13);
+        state.record_progress(progress_for(id, "a.bin", ProgressState::Pulling, 90, 100));
+        let active = state.next_transfer_deadline().unwrap();
+        assert!(active.saturating_duration_since(std::time::Instant::now()) > TRANSFER_RETENTION);
+
+        state.record_progress(progress_for(id, "a.bin", ProgressState::Done, 100, 100));
+        let done = state.next_transfer_deadline().unwrap();
+        let remaining = done.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining <= TRANSFER_RETENTION,
+            "a terminal event must shorten the window to retention: {remaining:?}"
+        );
+        // Exactly one deadline per transfer, not two.
+        assert_eq!(state.transfer_clear_at.len(), 1);
+    }
+
+    #[test]
+    fn progress_from_a_previous_generation_is_ignored() {
+        // M2: an old subscriber can still have events buffered when a reload
+        // swaps supervisors. Their `generation` no longer matches the live one,
+        // so the loop drops them and the new generation's list is not polluted.
+        let (mut state, _rt) = live_state(5);
+
+        assert!(
+            is_live_supervisor_event(&state, 5),
+            "the running supervisor's own events must be accepted"
+        );
+        assert!(
+            !is_live_supervisor_event(&state, 4),
+            "a previous generation's buffered event must be dropped"
+        );
+        assert!(
+            !is_live_supervisor_event(&state, 6),
+            "a future generation cannot be live yet"
+        );
+
+        // Dropping is what keeps the list clean: the event itself is perfectly
+        // applicable, so the guard — not the event — is doing the work.
+        state.record_progress(progress_for(
+            TransferId::from_u128(21),
+            "old.bin",
+            ProgressState::Pulling,
+            50,
+            100,
+        ));
+        assert_eq!(state.transfers.len(), 1);
+    }
+
+    #[test]
+    fn supervisor_scoped_events_are_dropped_once_no_supervisor_is_installed() {
+        // The asymmetry this replaces: `TransferProgress` and
+        // `ClientStatusChanged` used to compare the generation alone, so an
+        // event from a forwarder that had not noticed the shutdown would still
+        // be applied while the tray was showing "no supervisor". All three
+        // supervisor-scoped events now share one predicate.
+        let (mut state, _rt) = live_state(9);
+        assert!(is_live_supervisor_event(&state, 9));
+
+        // Same generation, but the supervisor is gone (`take()` leaves the
+        // generation number unchanged — only `abort_running` bumps it).
+        state.supervisor = None;
+        assert_eq!(
+            state.supervisor_gen, 9,
+            "the generation itself still matches"
+        );
+        assert!(
+            !is_live_supervisor_event(&state, 9),
+            "a matching generation must not resurrect a dead supervisor's events"
+        );
+
+        // And the event that already exists for a dead supervisor must not
+        // pass either: `SupervisorExited` is handled only for a live one.
+        // This is the guard's shape, asserted directly.
+        assert_eq!(current_supervisor_gen(&state), None);
+    }
+
+    #[test]
+    fn abort_running_retires_the_generation_so_stale_events_cannot_match() {
+        // m1(a): `abort_running` clears the list but does not install a
+        // replacement. Without the generation bump, buffered progress from the
+        // aborted supervisor would still pass `is_live_supervisor_event` for
+        // any reload path that bails before `apply_loaded_config` spawns a
+        // successor (i.e. an invalid config).
+        let (mut state, _rt) = live_state(12);
+        let live_gen = state.supervisor_gen;
+        assert!(is_live_supervisor_event(&state, live_gen));
+
+        abort_running(&mut state);
+
+        assert!(
+            !is_live_supervisor_event(&state, live_gen),
+            "an aborted generation must not remain live"
+        );
+        assert!(
+            state.next_transfer_deadline().is_none(),
+            "no deadline survives the abort"
+        );
+    }
+
+    /// A `State` with a real (never-completing) supervisor task installed, so
+    /// `current_supervisor_gen` reports `Some`. The runtime is returned so the
+    /// task outlives the assertions.
+    fn live_state(generation: u64) -> (State, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().expect("test runtime");
+        let handle = rt.handle().clone();
+        let task = handle.spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let mut state = empty_state();
+        state.supervisor_gen = generation;
+        state.supervisor = Some(task);
+        (state, rt)
+    }
+
+    #[test]
+    fn abort_running_clears_transfer_state() {
+        // M2's other half: a reload must not carry the old generation's
+        // transfers into the new one.
+        let mut state = empty_state();
+        state.record_progress(progress_for(
+            TransferId::from_u128(31),
+            "a.bin",
+            ProgressState::Pulling,
+            10,
+            100,
+        ));
+        state.record_progress(progress_for(
+            TransferId::from_u128(32),
+            "b.bin",
+            ProgressState::Done,
+            100,
+            100,
+        ));
+        assert_eq!(state.transfers.len(), 2);
+
+        abort_running(&mut state);
+        assert!(state.transfers.is_empty());
+        assert!(state.transfer_clear_at.is_empty());
+        assert!(state.next_transfer_deadline().is_none());
+    }
 
     #[test]
     fn hub_peer_line_pluralises() {
@@ -943,5 +1855,194 @@ mod tests {
             format_hub_peer_line(7),
             "\nhub running (7 clients connected)"
         );
+    }
+
+    #[test]
+    fn header_counts_done_and_failed_separately() {
+        let transfers = vec![
+            progress("ok.bin", ProgressState::Done, 100, 100),
+            progress("bad.bin", ProgressState::Failed, 0, 100),
+        ];
+        let header = format_transfer_header(&transfers);
+        assert!(header.contains("1 done"), "{header}");
+        assert!(header.contains("1 failed"), "{header}");
+        assert_eq!(header, "Transfers (1 done, 1 failed)");
+    }
+
+    /// A progress event for an explicit `(file_id, transfer_id)` pair.
+    fn progress_for_session(
+        file_id: TransferId,
+        transfer_id: TransferId,
+        state: ProgressState,
+        done: u64,
+        total: u64,
+    ) -> TransferProgress {
+        let mut event = progress_for(file_id, "a.bin", state, done, total);
+        event.transfer_id = Some(transfer_id);
+        event
+    }
+
+    #[test]
+    fn two_transfers_of_one_file_get_separate_rows() {
+        // Lazy mode lets one file be pasted twice at once; each paste pulls
+        // under its own `transfer_id`. Keying on `file_id` alone made the
+        // second transfer's first event overwrite the first transfer's row, so
+        // the user saw one row jumping between two progress values.
+        let mut state = empty_state();
+        let file_id = TransferId::from_u128(0xf11e);
+        let first = TransferId::from_u128(1);
+        let second = TransferId::from_u128(2);
+
+        state.record_progress(progress_for_session(
+            file_id,
+            first,
+            ProgressState::Pulling,
+            10,
+            100,
+        ));
+        state.record_progress(progress_for_session(
+            file_id,
+            second,
+            ProgressState::Pulling,
+            30,
+            100,
+        ));
+
+        assert_eq!(
+            state.transfers.len(),
+            2,
+            "one row per transfer, not one per file"
+        );
+        assert_eq!(state.transfers[0].transfer_id, Some(first));
+        assert_eq!(
+            state.transfers[0].bytes_done, 10,
+            "the first row kept its own progress"
+        );
+        assert_eq!(state.transfers[1].transfer_id, Some(second));
+        assert_eq!(state.transfers[1].bytes_done, 30);
+        assert_eq!(
+            state.transfer_clear_at.len(),
+            2,
+            "the deadline table must be per transfer too"
+        );
+
+        // The header counts rows, so it must say two.
+        let header = format_transfer_header(&state.transfers);
+        assert_eq!(header, "Transfers in progress (2)");
+    }
+
+    #[test]
+    fn an_eager_transfer_still_uses_one_row() {
+        // The eager path carries no session, so repeated events for one file
+        // must still collapse: keying on the pair must not turn every chunk
+        // event into a new row.
+        let mut state = empty_state();
+        let file_id = TransferId::from_u128(0xeae6e2);
+
+        state.record_progress(progress_for(
+            file_id,
+            "a.bin",
+            ProgressState::Hashing,
+            1,
+            100,
+        ));
+        state.record_progress(progress_for(
+            file_id,
+            "a.bin",
+            ProgressState::Hashing,
+            50,
+            100,
+        ));
+        state.record_progress(progress_for(
+            file_id,
+            "a.bin",
+            ProgressState::Done,
+            100,
+            100,
+        ));
+
+        assert_eq!(state.transfers.len(), 1, "eager collapses to one row");
+        assert_eq!(state.transfers[0].state, ProgressState::Done);
+        assert_eq!(state.transfer_clear_at.len(), 1, "and one deadline");
+    }
+
+    #[test]
+    fn completing_one_of_two_concurrent_transfers_leaves_the_other() {
+        // The second half of the bug: `retain(|t| t.file_id != event.file_id)`
+        // cleared *both* rows when the first transfer reported `Done`.
+        let mut state = empty_state();
+        let file_id = TransferId::from_u128(0x5a4ed);
+        let done_first = TransferId::from_u128(3);
+        let still_running = TransferId::from_u128(4);
+
+        state.record_progress(progress_for_session(
+            file_id,
+            done_first,
+            ProgressState::Pulling,
+            10,
+            100,
+        ));
+        state.record_progress(progress_for_session(
+            file_id,
+            still_running,
+            ProgressState::Pulling,
+            40,
+            100,
+        ));
+
+        state.record_progress(progress_for_session(
+            file_id,
+            done_first,
+            ProgressState::Done,
+            100,
+            100,
+        ));
+
+        assert_eq!(
+            state.transfers.len(),
+            2,
+            "a Done on one transfer must not clear the other"
+        );
+        let finished = state
+            .transfers
+            .iter()
+            .find(|t| t.transfer_id == Some(done_first))
+            .expect("the finished transfer is still listed for its retention window");
+        assert_eq!(finished.state, ProgressState::Done);
+        let running = state
+            .transfers
+            .iter()
+            .find(|t| t.transfer_id == Some(still_running))
+            .expect("the concurrent transfer survives");
+        assert_eq!(running.state, ProgressState::Pulling);
+        assert_eq!(running.bytes_done, 40);
+
+        // And the retention deadline is per row: only the finished one is
+        // armed for the short window.
+        let done_deadline = state
+            .transfer_clear_at
+            .iter()
+            .find(|((fid, tid), _)| *fid == file_id && *tid == Some(done_first))
+            .map(|(_, at)| *at)
+            .expect("the finished row has a deadline");
+        let running_deadline = state
+            .transfer_clear_at
+            .iter()
+            .find(|((fid, tid), _)| *fid == file_id && *tid == Some(still_running))
+            .map(|(_, at)| *at)
+            .expect("the running row has a deadline");
+        assert!(
+            done_deadline < running_deadline,
+            "the finished row must expire first: {done_deadline:?} vs {running_deadline:?}"
+        );
+    }
+
+    #[test]
+    fn header_reports_a_lone_failure_as_failed_not_done() {
+        // The M1 symptom: a failed transfer alone used to render as
+        // "Transfers (1 done)" while its row said "sending x 0%".
+        let header = format_transfer_header(&[progress("bad.bin", ProgressState::Failed, 0, 100)]);
+        assert_eq!(header, "Transfers (1 failed)");
+        assert!(!header.contains("done"), "{header}");
     }
 }

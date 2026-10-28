@@ -1,0 +1,41 @@
+{
+  "phase": "active-transfers-cap",
+  "pending_operation": "cw-build-active-transfers-cap",
+  "builder_session": "b02422f4-9ad4-4ba3-aeb4-bc480a3c6d5f",
+  "reviewer_session": "108fb788-f6b8-44f7-bf12-d892d73b4577",
+  "process_correction": "All code changes go through Builder. Lead only reads, runs gates, greps, and edits openspec/ + AGENTS.md.",
+
+  "progress": {
+    "phase1": "COMPLETE", "phase2": "COMPLETE", "phase3": "COMPLETE", "phase4": "COMPLETE", "phase5": "COMPLETE",
+    "phase6_7": "BLOCKED on the user's real-GUI spikes 0.1 (macOS) and 0.2 (Windows)",
+    "phase8": "NOT STARTED -- does not depend on the spikes, but flipping the defaults before paste is proven would ship an unusable default"
+  },
+  "gates": "429 passed / 0 failed / 5 ignored, 8 consecutive runs (measured after the builder finished editing); fmt clean; clippy clean; NOTHING COMMITTED",
+
+  "hub_ttl_fix_verified": {
+    "delivered": "active_transfers keyed by transfer_id; continued transfers are exempt from the offer TTL; six tests",
+    "gates": "429 passed x8, all identical",
+    "the_builder_found_a_second_sweep_path": "I told it not to delete an offer a live transfer needs. It found that sweep_expired_offers also runs on every peer registration, so a peer joining mid-file would have destroyed an in-progress transfer through a path my instruction did not mention. It added that test and the offer-keybook in ActiveTransfer. Mutation 3 fails ONLY that test, which is exactly why it was worth adding.",
+    "mutation_design_note": "mutations 1 and 2 are equivalent (both disable the continued-check) and fail the same two tests; mutation 3 targets a different code path entirely. The builder ran all three rather than stopping at the two I asked for."
+  },
+
+  "defect_i_found_in_my_own_fix": {
+    "what": "active_transfers has no size bound",
+    "how": "the builder's closing note mentioned exempted offers counting toward caps; following that thread led to the map itself",
+    "attack": "one live offer plus unlimited distinct transfer_ids: every pull is authorised, every Delivered insert lands, and each entry lives TRANSFER_MEMORY_MS (30 min). Note Delivered only means the frame reached the source's channel -- it does not mean the source accepted the session, so a source answering busy still leaves an entry behind.",
+    "scale": "roughly 80 bytes per entry including table overhead; ~550 pulls/second sustains ~80 MB. MAX_OFFERS_TOTAL bounds offers but nothing bounded transfers.",
+    "fix_dispatched": "cap at 4 * MAX_OFFERS_TOTAL, evicted in BATCHES rather than one at a time -- single-entry eviction at the cap would rescan 16k entries on every subsequent pull, converting a memory bound into a CPU one",
+    "fails_closed": "a forgotten transfer simply returns to the TTL gate, which is the pre-existing behaviour"
+  },
+
+  "process_note": "I ran a stress loop while the builder was still editing and got 423 / 428 / 429 across iterations, plus a transient fmt failure that was just a mid-edit snapshot. None of those intermediate readings meant anything. Do not verify a tree another actor is writing.",
+
+  "known_debt": {
+    "tls_field_name": "ClientConfig.tls_ca_file at HEAD",
+    "phase2_fixture_gap": "v0.3 byte-compat fixture never passes through send_file_through",
+    "paste_mode": "ReceiveMode::Paste is accepted on Windows/macOS by config but no platform path implements it (Phase 6/7)",
+    "pickup_ui": "engine-only; no tray menu item yet",
+    "git": "NOTHING COMMITTED. Phases 1-5 are a coherent unit."
+  },
+  "next_action": "on result: verify the cap holds under a synthetic flood and that eviction does not thrash, then report and ask about committing"
+}

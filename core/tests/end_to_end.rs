@@ -92,9 +92,7 @@ async fn connect_and_welcome(
         panic!("expected welcome text frame, got {msg:?}");
     };
     let Frame::Welcome(WelcomeFrame {
-        server,
-        client_id,
-        last_clip: _,
+        server, client_id, ..
     }) = serde_json::from_str(&text).unwrap()
     else {
         panic!("first frame should be welcome");
@@ -174,12 +172,25 @@ async fn clip_fans_out_to_peer_but_not_sender() {
     assert_eq!(received.content.as_deref(), Some("hello from A"));
     assert_eq!(received.from, Some(id_a));
 
-    // A must NOT receive its own publish back. Give the hub a beat to settle
-    // and confirm no message arrives.
-    let echo = tokio::time::timeout(Duration::from_millis(200), a.next()).await;
+    // A must NOT receive its own publish back. A *does* get membership
+    // notices (`peer_changed` when B joined), so those are skipped rather than
+    // treated as an echo; anything else arriving is a real failure.
+    let echo = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            let msg = a.next().await.transpose().ok().flatten().expect("stream");
+            let Message::Text(text) = msg else { continue };
+            match serde_json::from_str::<Frame>(&text) {
+                Ok(Frame::PeerChanged(_)) => continue,
+                Ok(other) => return other,
+                Err(e) => panic!("unparseable frame: {e}"),
+            }
+        }
+    })
+    .await;
     assert!(
         echo.is_err(),
-        "sender should not see an echo of its own publish"
+        "sender should not see an echo of its own publish, got {:?}",
+        echo.ok()
     );
 
     a.close(None).await.ok();

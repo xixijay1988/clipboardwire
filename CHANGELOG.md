@@ -4,6 +4,52 @@ All notable changes to clipboardwire are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+Phase 4 of the lazy file-transfer work: identity and configuration plumbing.
+**No user-visible transfer behaviour changes yet** — both modes still default
+to `eager`, and the client does not advertise `lazy-file`.
+
+### ⚠️ Config compatibility
+
+A config written by this build **cannot be read by v0.5.4 or earlier** as soon
+as any new setting is saved. The client parses with `deny_unknown_fields`, so an
+older binary fails on the whole file rather than ignoring the keys it does not
+know — including when the settings dialog rewrites the file.
+
+New settings are **omitted from the file while they hold their default**
+(`send_mode = "eager"`, `receive_mode = "eager"`, `offer_ttl_minutes = 30`, …),
+so a config that never touches them stays readable by older versions. Setting
+any of them is what makes the file v0.4-only. Downgrading after touching them
+means editing the file (or regenerating it) first.
+
+### Added
+- **Durable device identity.** A `device_id` plus a host fingerprint, persisted
+  in the platform data directory (`~/.local/share/clipboardwire` on Linux,
+  `~/Library/Application Support/clipboardwire` on macOS). It is deliberately
+  **not** in `config.toml`, which the settings dialog rewrites wholesale. A
+  fingerprint mismatch — a cloned VM image, a restored backup — mints a new id
+  and logs a warning, because two machines sharing one id evict each other in a
+  loop under the newest-wins rule.
+- **New config keys**: `send_mode` (`lazy` | `eager`), `receive_mode`
+  (`auto` | `paste` | `pickup` | `eager`), `pickup_auto`,
+  `offer_ttl_minutes`, `pull_window_chunks`, `pull_idle_timeout_secs`. All are
+  inert until the lazy path ships; `receive_mode = "paste"` is rejected at
+  startup on Linux, where no paste-time hook exists.
+- **Protocol v0.4**: `file_offer` / `file_pull` / `file_digest` / `file_abort` /
+  `peer_changed` frame types, and `caps` / `peers` / `offers` on `welcome`.
+  The connection also sends its `device` and `caps` on the upgrade query.
+- **Settings dialog** now shows the transfer modes, the lazy-transfer tuning
+  values, and a `log_file_names` checkbox.
+- `clipboardwire send` uses an ephemeral device id per invocation. A persisted
+  one would make a one-shot send evict the user's own tray connection.
+
+### Fixed
+- **Settings dialog no longer discards `log_file_names` on save.** The key was
+  missing from both the form and the writer, so any save reset it to the
+  default — and with `deny_unknown_fields` the key was gone from the file
+  entirely, not merely ignored.
+
 ## [0.5.4] — 2026-09-30
 
 ### Fixed

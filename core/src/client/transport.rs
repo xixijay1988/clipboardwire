@@ -21,8 +21,9 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, instrument, trace, warn};
+use uuid::Uuid;
 
-use crate::protocol::{ClipFrame, FileChunkFrame, Frame};
+use crate::protocol::{Caps, ClipFrame, FileChunkFrame, Frame};
 use crate::server::auth::basic_header_value;
 
 use super::config::ClientConfig;
@@ -39,6 +40,18 @@ const OUTBOUND_BUF: usize = 8;
 /// hundreds of MB in process memory while waiting for the socket.
 const INBOUND_FILES_BUF: usize = 4;
 const OUTBOUND_FILES_BUF: usize = 4;
+/// Control frames (`file_offer` / `file_pull` / `file_digest` / `file_abort` /
+/// `peer_changed`) are small and low-rate — one per offer or session, not one
+/// per chunk — but they must not be dropped: a missed `file_pull` stalls a
+/// transfer until the idle timeout, and a missed `file_abort` leaks a session.
+/// 32 matches the clip channel: generous enough that a burst of
+/// `peer_changed`s at connect time (one per existing peer) never fills it, and
+/// small enough that a wedged supervisor is noticeable immediately.
+const INBOUND_CONTROL_BUF: usize = 32;
+/// Outbound control frames are produced by the user's actions, so there is
+/// never a burst: an offer per send, a pull per window, an abort per cancel.
+/// 8 is the same headroom the clip channel uses.
+const OUTBOUND_CONTROL_BUF: usize = 8;
 
 /// Connection-state snapshot the transport emits via the optional
 /// `status_tx` watch channel passed to [`spawn_with_status`]. The tray
@@ -68,6 +81,15 @@ pub struct Transport {
     pub outbound_tx: mpsc::Sender<ClipFrame>,
     /// Outbound `file_chunk` frames to push to the hub.
     pub outbound_files_tx: mpsc::Sender<FileChunkFrame>,
+    /// Inbound routed frames from the hub: `file_offer`, `file_pull`,
+    /// `file_digest`, `file_abort`, `peer_changed`. `welcome` shares the frame
+    /// type but is consumed on connect and never reaches this channel.
+    ///
+    /// `None` when the caller passed `receive_files = false` — a one-shot
+    /// sender has no use for frames it cannot act on.
+    pub inbound_control_rx: Option<mpsc::Receiver<Frame>>,
+    /// Outbound control frames: offers, pulls, digests, aborts.
+    pub outbound_control_tx: mpsc::Sender<Frame>,
 }
 
 /// Configuration for [`spawn_with_options`]. Optional flags layered on
@@ -86,6 +108,11 @@ pub struct SpawnOptions {
     /// one-shot `clipboardwire send` subcommand which doesn't want
     /// the supervisor's reconnect-forever behavior.
     pub one_shot: bool,
+    /// Device identity to advertise on the upgrade. `None` for a one-shot
+    /// `send`, which uses an ephemeral id (4.5) rather than a persisted one.
+    pub device: Option<uuid::Uuid>,
+    /// Capabilities this client advertises. Empty for a v0.3-shaped client.
+    pub caps: Caps,
 }
 
 /// Spawn the transport task. Returns the supervisor-facing handle and a join
@@ -107,6 +134,7 @@ pub fn spawn_with_status(
             status_tx,
             receive_files: true,
             one_shot: false,
+            ..SpawnOptions::default()
         },
     )
 }
@@ -128,18 +156,33 @@ pub fn spawn_with_options(
     } else {
         (None, None)
     };
+    let (inbound_control_tx, inbound_control_rx) = if options.receive_files {
+        let (tx, rx) = mpsc::channel::<Frame>(INBOUND_CONTROL_BUF);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let (outbound_control_tx, outbound_control_rx) = mpsc::channel::<Frame>(OUTBOUND_CONTROL_BUF);
     let SpawnOptions {
         status_tx,
         one_shot,
+        device,
+        caps,
         ..
     } = options;
+    let links = Links {
+        inbound_tx,
+        inbound_files_tx,
+        inbound_control_tx,
+        outbound_rx,
+        outbound_files_rx,
+        outbound_control_rx,
+    };
     let join = tokio::spawn(async move {
         run_loop(
             config,
-            inbound_tx,
-            inbound_files_tx,
-            outbound_rx,
-            outbound_files_rx,
+            WireOptions { device, caps },
+            links,
             status_tx,
             one_shot,
         )
@@ -151,18 +194,41 @@ pub fn spawn_with_options(
             inbound_files_rx,
             outbound_tx,
             outbound_files_tx,
+            inbound_control_rx,
+            outbound_control_tx,
         },
         join,
     )
 }
 
-#[instrument(skip_all, fields(server = %config.server))]
-async fn run_loop(
-    config: ClientConfig,
+/// What goes into the upgrade query, kept together so `run_loop` does not grow
+/// two more positional arguments that are easy to swap.
+#[derive(Debug, Clone, Copy)]
+struct WireOptions {
+    device: Option<Uuid>,
+    caps: Caps,
+}
+
+/// The six data paths one connection serves.
+///
+/// Bundled rather than passed positionally: six arguments of four similar types
+/// (`Sender<X>` / `Receiver<X>`, all `mpsc`, two of them `Option`) is a
+/// signature where a silent swap compiles fine and misroutes traffic.
+struct Links {
     inbound_tx: mpsc::Sender<ClipFrame>,
     inbound_files_tx: Option<mpsc::Sender<FileChunkFrame>>,
-    mut outbound_rx: mpsc::Receiver<ClipFrame>,
-    mut outbound_files_rx: mpsc::Receiver<FileChunkFrame>,
+    inbound_control_tx: Option<mpsc::Sender<Frame>>,
+    outbound_rx: mpsc::Receiver<ClipFrame>,
+    outbound_files_rx: mpsc::Receiver<FileChunkFrame>,
+    outbound_control_rx: mpsc::Receiver<Frame>,
+}
+
+#[instrument(skip_all, fields(server = %config.server))]
+
+async fn run_loop(
+    config: ClientConfig,
+    wire: WireOptions,
+    mut links: Links,
     status_tx: Option<watch::Sender<ClientStatus>>,
     one_shot: bool,
 ) {
@@ -177,15 +243,7 @@ async fn run_loop(
     loop {
         emit(ClientStatus::Connecting);
         let attempt_start = Instant::now();
-        let outcome = connect_and_serve(
-            &config,
-            &inbound_tx,
-            inbound_files_tx.as_ref(),
-            &mut outbound_rx,
-            &mut outbound_files_rx,
-            status_tx.as_ref(),
-        )
-        .await;
+        let outcome = connect_and_serve(&config, wire, &mut links, status_tx.as_ref()).await;
         match &outcome {
             Ok(()) => debug!("connection ended cleanly"),
             Err(e) => warn!(error = %format!("{e:#}"), "connection error"),
@@ -231,16 +289,132 @@ where
     Ok(())
 }
 
+/// Flush everything still queued and close cleanly.
+///
+/// **Every** arm that observes a closed channel must come through here. The
+/// outbound channels close together when the owner drops the `Transport`, and
+/// `select!` picks among ready arms at random — an arm that returns directly
+/// discards whatever the other two still hold. That is not theoretical: giving
+/// only the clip arm a drain left a ~1-in-3 chance that the control arm won
+/// the race with file chunks still queued, and the receiver then waited for a
+/// chunk that would never arrive.
+///
+/// The order is deliberate, worst-consequence first:
+///
+/// 1. file chunks — a dropped chunk means a corrupt or incomplete file, and
+///    nothing downstream can repair it;
+/// 2. control frames — a dropped `file_pull` stalls a transfer until the idle
+///    timeout, which looks the same to the user as a hang;
+/// 3. clips — last-writer-wins, and the next poll re-sends, so losing one
+///    costs at most a single clipboard update.
+///
+/// Only what is *already queued* is flushed: `try_recv` stops at `Empty`, so a
+/// still-open channel does not make this wait for new work.
+async fn drain_and_finish<S>(links: &mut Links, sink: &mut S) -> Result<()>
+where
+    S: futures_util::sink::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    drain_outbound_files(&mut links.outbound_files_rx, sink).await?;
+
+    while let Ok(frame) = links.outbound_control_rx.try_recv() {
+        let json = serde_json::to_string(&frame)?;
+        if let Err(e) = sink.send(Message::Text(json.into())).await {
+            warn!(error = %e, "control frame send failed during drain");
+            // Do not abort the rest of the drain: a failure here is about this
+            // connection, and the remaining channel may still be writable.
+            break;
+        }
+    }
+
+    while let Ok(clip) = links.outbound_rx.try_recv() {
+        let json = serde_json::to_string(&Frame::Clip(clip))?;
+        if let Err(e) = sink.send(Message::Text(json.into())).await {
+            warn!(error = %e, "clip send failed during drain");
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Build the upgrade URL, appending `caps` and `device` when present.
+///
+/// `into_client_request` takes a `&str`, so the query has to be assembled here
+/// rather than through a URL builder. Both values are percent-encoded: a device
+/// id is a UUID and `caps` is a comma-joined list of `[a-z0-9-]` tokens, so
+/// neither needs it today — but the token grammar can gain characters, and an
+/// unescaped `&` in a value would silently split the query.
+///
+/// A server URL that already carries a query is joined with `&`, not a second
+/// `?` — the user may have written one by hand (a proxy hint, a token).
+pub(crate) fn upgrade_url(server: &str, device: Option<Uuid>, caps: Caps) -> String {
+    let mut query = String::new();
+    if !caps.is_empty() {
+        query.push_str("caps=");
+        query.push_str(&percent_encode(&caps.tokens().join(",")));
+    }
+    if let Some(device) = device {
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str("device=");
+        query.push_str(&percent_encode(&device.to_string()));
+    }
+    if query.is_empty() {
+        return server.to_string();
+    }
+
+    // A fragment would have to stay last, so insert before it. No real server
+    // URL carries one, but silently producing `ws://h/sync?caps=…#frag` is
+    // wrong in a way that is hard to see.
+    let (base, fragment) = match server.find('#') {
+        Some(index) => (&server[..index], &server[index..]),
+        None => (server, ""),
+    };
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}{query}{fragment}")
+}
+
+/// Whether the hub contradicted itself: it listed offers but does not claim
+/// the capability to serve them.
+///
+/// A hub builds both from the same state, so this is a hub bug or a proxy
+/// rewriting the frame. Logged rather than acted on: the safer reading is
+/// "there is nothing I can pull", which is what an unadvertised capability
+/// already means.
+fn welcome_is_inconsistent(welcome: &crate::protocol::WelcomeFrame) -> bool {
+    !welcome.offers.is_empty()
+        && !Caps::parse_guarded(&welcome.caps.join(",")).contains(Caps::LAZY_FILE)
+}
+
+/// Percent-encode everything outside the RFC 3986 unreserved set.
+///
+/// Hand-rolled rather than pulled from a crate: the input is one UUID and a
+/// handful of `[a-z0-9-]` tokens, so this is 15 lines against a dependency, and
+/// the encoding has to be *stable* not clever.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
 async fn connect_and_serve(
     config: &ClientConfig,
-    inbound_tx: &mpsc::Sender<ClipFrame>,
-    inbound_files_tx: Option<&mpsc::Sender<FileChunkFrame>>,
-    outbound_rx: &mut mpsc::Receiver<ClipFrame>,
-    outbound_files_rx: &mut mpsc::Receiver<FileChunkFrame>,
+    wire: WireOptions,
+    links: &mut Links,
     status_tx: Option<&watch::Sender<ClientStatus>>,
 ) -> Result<()> {
-    let mut req = config
-        .server
+    let url = upgrade_url(&config.server, wire.device, wire.caps);
+    let mut req = url
         .as_str()
         .into_client_request()
         .map_err(|e| anyhow!("invalid server URL: {e}"))?;
@@ -275,16 +449,35 @@ async fn connect_and_serve(
         },
         other => bail!("expected text welcome, got {other:?}"),
     };
+    // A v0.3 hub sends none of these; an absent `caps` means "no
+    // capabilities", which is exactly what makes a mixed deployment fall back
+    // to eager.
+    let hub_caps = Caps::parse_guarded(&welcome.caps.join(","));
     debug!(
         server = %welcome.server,
         client_id = %welcome.client_id,
+        hub_caps = ?hub_caps.tokens(),
+        peers = welcome.peers.len(),
+        offers = welcome.offers.len(),
         has_last_clip = welcome.last_clip.is_some(),
         "welcomed"
     );
 
+    // `peers` and `offers` are only logged for now; feeding them to the
+    // supervisor is Phase 5. They are parsed out regardless so that "what the
+    // hub said" is never lost between here and there.
+    if welcome_is_inconsistent(&welcome) {
+        warn!(
+            offers = welcome.offers.len(),
+            hub_caps = ?hub_caps.tokens(),
+            "hub sent offers without advertising lazy-file; the hub and its \
+             own capability list disagree"
+        );
+    }
+
     // Surface a cached clip (if any) to the supervisor as an inbound event.
     if let Some(clip) = welcome.last_clip {
-        let _ = inbound_tx.send(clip).await;
+        let _ = links.inbound_tx.send(clip).await;
     }
 
     let mut ping_timer = tokio::time::interval(PING_INTERVAL);
@@ -292,17 +485,10 @@ async fn connect_and_serve(
 
     loop {
         tokio::select! {
-            outbound = outbound_rx.recv() => {
+            outbound = links.outbound_rx.recv() => {
                 let Some(clip) = outbound else {
-                    debug!("outbound channel closed; draining outbound_files before exit");
-                    // Drain any buffered file chunks BEFORE bailing.
-                    // Otherwise a `select!` race on a simultaneous drop
-                    // of both outbound senders can pick the empty clip
-                    // arm first and discard the queued file chunks —
-                    // which is exactly what the `clipboardwire send`
-                    // one-shot path does on completion.
-                    drain_outbound_files(outbound_files_rx, &mut sink).await?;
-                    return Ok(());
+                    debug!("outbound clips closed; flushing before exit");
+                    return drain_and_finish(links, &mut sink).await;
                 };
                 let json = serde_json::to_string(&Frame::Clip(clip))?;
                 if let Err(e) = sink.send(Message::Text(json.into())).await {
@@ -310,14 +496,33 @@ async fn connect_and_serve(
                     return Err(e.into());
                 }
             }
-            outbound_file = outbound_files_rx.recv() => {
+            outbound_file = links.outbound_files_rx.recv() => {
                 let Some(chunk) = outbound_file else {
-                    debug!("outbound files channel closed; exiting");
-                    return Ok(());
+                    // Closing the file channel does not mean the others are
+                    // empty: the one-shot `send` path drops the whole
+                    // `Transport`, so all three close at once and this arm can
+                    // win with a clip or a pull still queued.
+                    debug!("outbound files closed; flushing before exit");
+                    return drain_and_finish(links, &mut sink).await;
                 };
                 let json = serde_json::to_string(&Frame::FileChunk(chunk))?;
                 if let Err(e) = sink.send(Message::Text(json.into())).await {
                     warn!(error = %e, "file_chunk send failed");
+                    return Err(e.into());
+                }
+            }
+            outbound_control = links.outbound_control_rx.recv() => {
+                let Some(frame) = outbound_control else {
+                    // The arm most likely to win the shutdown race, and the
+                    // one that used to be the most destructive: this channel is
+                    // usually empty-but-closed, so it reports `None` instantly
+                    // while the file channel still holds most of a transfer.
+                    debug!("outbound control closed; flushing before exit");
+                    return drain_and_finish(links, &mut sink).await;
+                };
+                let json = serde_json::to_string(&frame)?;
+                if let Err(e) = sink.send(Message::Text(json.into())).await {
+                    warn!(error = %e, "control frame send failed");
                     return Err(e.into());
                 }
             }
@@ -337,12 +542,12 @@ async fn connect_and_serve(
                         };
                         match frame {
                             Frame::Clip(clip) => {
-                                if inbound_tx.send(clip).await.is_err() {
+                                if links.inbound_tx.send(clip).await.is_err() {
                                     return Ok(());
                                 }
                             }
                             Frame::FileChunk(chunk) => {
-                                if let Some(tx) = inbound_files_tx.as_ref() {
+                                if let Some(tx) = links.inbound_files_tx.as_ref() {
                                     if tx.send(chunk).await.is_err() {
                                         return Ok(());
                                     }
@@ -355,6 +560,31 @@ async fn connect_and_serve(
                             }
                             Frame::Welcome(_) => {
                                 warn!("ignoring unexpected second welcome");
+                            }
+                            // The five routed control frames. Listed one by
+                            // one rather than through `_`: a new `Frame`
+                            // variant must then make this match fail to
+                            // compile, which is the reminder to decide where
+                            // it belongs.
+                            Frame::FileOffer(_)
+                            | Frame::FilePull(_)
+                            | Frame::FileDigest(_)
+                            | Frame::FileAbort(_)
+                            | Frame::PeerChanged(_) => {
+                                match links.inbound_control_tx.as_ref() {
+                                    Some(tx) => {
+                                        // The supervisor is gone: same
+                                        // condition as a closed clip channel,
+                                        // so end the connection rather than
+                                        // dropping frames nobody will read.
+                                        if tx.send(frame).await.is_err() {
+                                            return Ok(());
+                                        }
+                                    }
+                                    None => {
+                                        trace!("ignoring inbound control frame; no receiver wired");
+                                    }
+                                }
                             }
                         }
                     }
@@ -377,5 +607,149 @@ async fn connect_and_serve(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{FileOfferFrame, WelcomeFrame, WelcomePeer};
+
+    fn welcome_with(caps: &[&str], offers: usize) -> WelcomeFrame {
+        WelcomeFrame {
+            server: "clipboardwire/0.4.0".to_string(),
+            client_id: Uuid::new_v4(),
+            caps: caps.iter().map(|c| c.to_string()).collect(),
+            peers: vec![WelcomePeer {
+                device: Uuid::new_v4(),
+                caps: vec!["lazy-file".to_string()],
+            }],
+            offers: (0..offers)
+                .map(|_| FileOfferFrame {
+                    file_id: Uuid::new_v4(),
+                    batch_id: Uuid::new_v4(),
+                    ts: 0,
+                    name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    file_size: 1024,
+                    expires_at_ms: 1_000_000,
+                    from_device: None,
+                })
+                .collect(),
+            last_clip: None,
+        }
+    }
+
+    // ---- upgrade query ----
+
+    #[test]
+    fn upgrade_url_appends_device_and_caps() {
+        let device = Uuid::new_v4();
+        let url = upgrade_url(
+            "ws://h.lan:8484/sync",
+            Some(device),
+            Caps::LAZY_FILE | Caps::FILE_RECV,
+        );
+        assert!(url.starts_with("ws://h.lan:8484/sync?"), "{url}");
+        assert!(url.contains("device="), "{url}");
+        assert!(url.contains(&device.to_string()), "{url}");
+        assert!(url.contains("caps="), "{url}");
+        // Order inside `caps` follows `Caps::KNOWN`, which is what `tokens()`
+        // guarantees; asserting both tokens rather than the joined string keeps
+        // this from breaking on an unrelated KNOWN reordering.
+        assert!(url.contains("lazy-file"), "{url}");
+        assert!(url.contains("file-recv"), "{url}");
+    }
+
+    #[test]
+    fn upgrade_url_omits_empty_values() {
+        // The v0.3 shape: nothing to say. A stray `?` here would change the
+        // path the server routes on.
+        assert_eq!(
+            upgrade_url("ws://h.lan:8484/sync", None, Caps::default()),
+            "ws://h.lan:8484/sync"
+        );
+    }
+
+    #[test]
+    fn upgrade_url_uses_ampersand_when_a_query_exists() {
+        let device = Uuid::new_v4();
+        let url = upgrade_url("ws://h/sync?x=1", Some(device), Caps::default());
+        assert!(url.starts_with("ws://h/sync?x=1&device="), "{url}");
+        assert!(!url.contains("?device="), "second `?` in {url}");
+        let with_caps = upgrade_url("ws://h/sync?x=1", None, Caps::LAZY_FILE);
+        assert!(
+            with_caps.starts_with("ws://h/sync?x=1&caps="),
+            "{with_caps}"
+        );
+    }
+
+    #[test]
+    fn upgrade_url_escapes_values_rather_than_splitting_the_query() {
+        // No current token needs this, but the function must not be the reason
+        // a future one breaks: a raw `&` would silently end the value.
+        assert_eq!(percent_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(percent_encode("lazy-file"), "lazy-file");
+        assert_eq!(percent_encode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn upgrade_url_keeps_a_fragment_last() {
+        let device = Uuid::new_v4();
+        let url = upgrade_url("ws://h/sync#frag", Some(device), Caps::default());
+        assert!(url.ends_with("#frag"), "{url}");
+        assert!(url.contains("device="), "{url}");
+        assert!(!url.contains("#frag?"), "{url}");
+    }
+
+    // ---- welcome parsing ----
+
+    #[test]
+    fn a_v03_welcome_yields_no_hub_caps() {
+        // A v0.3 hub omits the field entirely; serde fills in the empty vec,
+        // and "no capabilities" is what makes a mixed deployment fall back to
+        // eager instead of waiting for offers that will never come.
+        let raw = r#"{"type":"welcome","server":"clipboardwire/0.3.0",
+                      "client_id":"00000000-0000-0000-0000-000000000001",
+                      "last_clip":null}"#;
+        let frame: Frame = serde_json::from_str(raw).unwrap();
+        let Frame::Welcome(welcome) = frame else {
+            panic!("expected welcome");
+        };
+        assert!(welcome.caps.is_empty());
+        assert!(Caps::parse_guarded(&welcome.caps.join(",")).is_empty());
+        assert!(
+            !welcome_is_inconsistent(&welcome),
+            "an empty hub is consistent"
+        );
+    }
+
+    #[test]
+    fn a_v04_welcome_yields_lazy_file() {
+        let welcome = welcome_with(&["lazy-file"], 0);
+        let caps = Caps::parse_guarded(&welcome.caps.join(","));
+        assert!(caps.contains(Caps::LAZY_FILE), "{:?}", caps.tokens());
+        assert!(!welcome_is_inconsistent(&welcome));
+    }
+
+    #[test]
+    fn welcome_offers_without_the_cap_are_logged() {
+        // Pure logic only: the warn! itself needs a subscriber. The condition
+        // is what matters — offers with no capability is a hub that disagrees
+        // with itself, and the client's reading must be "nothing to pull".
+        assert!(
+            welcome_is_inconsistent(&welcome_with(&[], 2)),
+            "offers without lazy-file must be flagged"
+        );
+        assert!(
+            !welcome_is_inconsistent(&welcome_with(&["lazy-file"], 2)),
+            "offers with lazy-file are normal"
+        );
+        assert!(
+            !welcome_is_inconsistent(&welcome_with(&[], 0)),
+            "no offers is not an inconsistency"
+        );
+        // `file-recv` alone does not license serving offers.
+        assert!(welcome_is_inconsistent(&welcome_with(&["file-recv"], 1)));
     }
 }

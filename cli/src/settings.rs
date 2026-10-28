@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use clipboardwire_core::client::config::{
+    is_default_offer_ttl, is_default_pull_idle_timeout, is_default_pull_window,
+    is_default_receive_mode, is_default_send_mode, ReceiveMode, SendMode,
+};
 use clipboardwire_core::client::ClientConfig;
 use eframe::egui;
 
@@ -105,6 +109,13 @@ fn load_or_default(path: &Path) -> FormState {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 tls_insecure: cfg.tls_insecure,
+                log_file_names: cfg.log_file_names,
+                send_mode: cfg.send_mode,
+                receive_mode: cfg.receive_mode,
+                pickup_auto: cfg.pickup_auto,
+                offer_ttl_minutes: cfg.offer_ttl_minutes,
+                pull_window_chunks: cfg.pull_window_chunks,
+                pull_idle_timeout_secs: cfg.pull_idle_timeout_secs,
                 hub_enabled: hub.enabled,
                 hub_bind: hub.bind.to_string(),
                 hub_user: hub.user,
@@ -128,7 +139,7 @@ fn load_or_default(path: &Path) -> FormState {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct FormState {
     server: String,
     user: String,
@@ -136,6 +147,15 @@ struct FormState {
     poll_ms: u64,
     tls_ca_file: String,
     tls_insecure: bool,
+    /// Log file names in clear. Previously missing from this form, which meant
+    /// any save silently reset the key to its default — see `write_toml`.
+    log_file_names: bool,
+    send_mode: SendMode,
+    receive_mode: ReceiveMode,
+    pickup_auto: bool,
+    offer_ttl_minutes: u32,
+    pull_window_chunks: u32,
+    pull_idle_timeout_secs: u64,
     // Hub section (optional [hub] in the TOML).
     hub_enabled: bool,
     hub_bind: String,
@@ -144,6 +164,38 @@ struct FormState {
     hub_tls_cert_file: String,
     hub_tls_key_file: String,
     last_error: Option<String>,
+}
+
+/// Hand-written rather than derived: the three numeric fields default to zero
+/// under `derive(Default)`, and a zero TTL or window is rejected by
+/// `validate_modes`. A fresh form must open with the same values a config
+/// without those keys would have.
+impl Default for FormState {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            user: String::new(),
+            password: String::new(),
+            poll_ms: DEFAULT_POLL_MS,
+            tls_ca_file: String::new(),
+            tls_insecure: false,
+            log_file_names: false,
+            send_mode: SendMode::default(),
+            receive_mode: ReceiveMode::default(),
+            pickup_auto: false,
+            offer_ttl_minutes: clipboardwire_core::client::config::default_offer_ttl_minutes(),
+            pull_window_chunks: clipboardwire_core::client::config::default_pull_window_chunks(),
+            pull_idle_timeout_secs:
+                clipboardwire_core::client::config::default_pull_idle_timeout_secs(),
+            hub_enabled: false,
+            hub_bind: String::new(),
+            hub_user: String::new(),
+            hub_password: String::new(),
+            hub_tls_cert_file: String::new(),
+            hub_tls_key_file: String::new(),
+            last_error: None,
+        }
+    }
 }
 
 struct SettingsApp {
@@ -310,6 +362,71 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .join(":")
 }
 
+/// Send-mode dropdown.
+///
+/// Labels are sentences rather than the raw config values: "lazy" alone does
+/// not say *what* is lazy, and the difference only shows up minutes later when
+/// a peer pastes.
+fn send_mode_combo(ui: &mut egui::Ui, value: &mut SendMode) {
+    let label = match value {
+        SendMode::Eager => "Eager (send immediately)",
+        SendMode::Lazy => "Lazy (let peers pull on paste)",
+    };
+    egui::ComboBox::from_id_salt("send_mode")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, SendMode::Eager, "Eager (send immediately)");
+            ui.selectable_value(value, SendMode::Lazy, "Lazy (let peers pull on paste)");
+        });
+}
+
+/// Receive-mode dropdown.
+///
+/// `Paste` is omitted where the platform cannot materialise a pull at paste
+/// time. The alternative — offer it and refuse the save — makes the user fill
+/// in the whole form before learning the choice was never possible.
+fn receive_mode_combo(ui: &mut egui::Ui, value: &mut ReceiveMode) {
+    let label = |mode: ReceiveMode| match mode {
+        ReceiveMode::Eager => "Eager (as before)",
+        ReceiveMode::Auto => "Auto (by platform)",
+        ReceiveMode::Pickup => "Pickup (retrieve from tray)",
+        ReceiveMode::Paste => "Paste (platform clipboard)",
+    };
+    egui::ComboBox::from_id_salt("receive_mode")
+        .selected_text(label(*value))
+        .show_ui(ui, |ui| {
+            for mode in [
+                ReceiveMode::Eager,
+                ReceiveMode::Auto,
+                ReceiveMode::Pickup,
+                ReceiveMode::Paste,
+            ] {
+                if mode == ReceiveMode::Paste && !paste_supported() {
+                    // Disabled with the reason in the tooltip; still rendered
+                    // so the option is visibly *not available* rather than
+                    // silently absent, which reads like a bug.
+                    ui.add_enabled(
+                        false,
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{} — not supported on {}",
+                                label(mode),
+                                std::env::consts::OS
+                            ))
+                            .weak(),
+                        ),
+                    )
+                    .on_hover_text(
+                        "Paste needs a platform clipboard that can materialise a pull at \
+                         paste time (Phase 0 spike). Use Pickup instead.",
+                    );
+                    continue;
+                }
+                ui.selectable_value(value, mode, label(mode));
+            }
+        });
+}
+
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.draw(ctx);
@@ -381,6 +498,26 @@ impl SettingsApp {
                         "DANGEROUS — LAN/VPN only",
                     ));
                     ui.end_row();
+
+                    ui.label("Log file names");
+                    ui.add(egui::Checkbox::new(
+                        &mut self.form.log_file_names,
+                        "Write real names to the log (default: pseudonyms)",
+                    ))
+                    .on_hover_text(
+                        "Off by default: INFO and above carry `file#<hex>` instead of the real \
+                         name, so a log does not become a record of everything copied. Turn this \
+                         on only while debugging a specific transfer.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Send files");
+                    send_mode_combo(ui, &mut self.form.send_mode);
+                    ui.end_row();
+
+                    ui.label("Receive files");
+                    receive_mode_combo(ui, &mut self.form.receive_mode);
+                    ui.end_row();
                 });
 
             ui.add_space(8.0);
@@ -427,6 +564,49 @@ impl SettingsApp {
                 });
             });
 
+            ui.add_space(8.0);
+            ui.separator();
+            ui.collapsing("Lazy transfer tuning", |ui| {
+                ui.label(
+                    "Only meaningful once lazy transfer ships. The defaults are what a \
+                     config without these keys gets.",
+                );
+                ui.add_space(4.0);
+                egui::Grid::new("transfer_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Retrieve without a tray");
+                        ui.add(egui::Checkbox::new(
+                            &mut self.form.pickup_auto,
+                            "Headless receivers fetch offers automatically",
+                        ));
+                        ui.end_row();
+
+                        ui.label("Offer TTL (minutes)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.form.offer_ttl_minutes).range(1..=1440),
+                        )
+                        .on_hover_text("How long a published offer stays pullable.");
+                        ui.end_row();
+
+                        ui.label("Chunks per pull");
+                        ui.add(
+                            egui::DragValue::new(&mut self.form.pull_window_chunks).range(1..=32),
+                        )
+                        .on_hover_text("How many 4 MiB chunks one `file_pull` asks for.");
+                        ui.end_row();
+
+                        ui.label("Pull idle timeout (s)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.form.pull_idle_timeout_secs)
+                                .range(1..=3600),
+                        )
+                        .on_hover_text("Give up on a pull that stops making progress.");
+                        ui.end_row();
+                    });
+            });
+
             ui.add_space(12.0);
 
             if let Some(err) = &self.form.last_error {
@@ -454,6 +634,41 @@ impl SettingsApp {
     }
 }
 
+/// A `ClientConfig` carrying only the mode-related fields.
+///
+/// The other required fields are filled with placeholders: `validate_modes`
+/// reads nothing but the six transfer settings, and duplicating the platform
+/// rules here would let the form accept something `load` later rejects.
+fn mode_config(form: &FormState) -> ClientConfig {
+    ClientConfig {
+        server: String::new(),
+        user: String::new(),
+        password: String::new(),
+        poll_ms: 300,
+        tls_ca_file: None,
+        tls_insecure: false,
+        hub: None,
+        log_file_names: form.log_file_names,
+        send_mode: form.send_mode,
+        receive_mode: form.receive_mode,
+        pickup_auto: form.pickup_auto,
+        offer_ttl_minutes: form.offer_ttl_minutes,
+        pull_window_chunks: form.pull_window_chunks,
+        pull_idle_timeout_secs: form.pull_idle_timeout_secs,
+    }
+}
+
+/// Whether `paste` is offered at all on this platform.
+///
+/// The spec wants an explicit unsupported mode to *fail validation*; the GUI
+/// goes one better and does not offer it, because a greyed-out entry with a
+/// reason is cheaper to understand than a save that is refused afterwards.
+/// `validate` still enforces the rule — this only decides what the dropdown
+/// shows.
+fn paste_supported() -> bool {
+    cfg!(any(target_os = "windows", target_os = "macos"))
+}
+
 /// Validate the form. Returns a human-readable error string on failure.
 fn validate(form: &FormState) -> std::result::Result<(), String> {
     if !form.server.starts_with("ws://") && !form.server.starts_with("wss://") {
@@ -467,6 +682,14 @@ fn validate(form: &FormState) -> std::result::Result<(), String> {
     }
     if form.poll_ms == 0 {
         return Err("Poll interval must be at least 1 ms".into());
+    }
+    // The mode rules live in `ClientConfig::validate_modes`, so the GUI cannot
+    // disagree with what `load` will do to the file it just wrote. Building a
+    // throwaway config is the cheapest way to reuse them without a second copy
+    // of the platform rules.
+    let modes = mode_config(form);
+    if let Err(e) = modes.validate_modes() {
+        return Err(format!("{e:#}"));
     }
     if form.hub_enabled {
         if form.hub_bind.parse::<std::net::SocketAddr>().is_err() {
@@ -502,6 +725,27 @@ struct WritableConfig<'a> {
     tls_ca_file: Option<&'a str>,
     #[serde(skip_serializing_if = "is_false")]
     tls_insecure: bool,
+    /// An existing key this form used to drop on every save. `ClientConfig`
+    /// parses with `deny_unknown_fields`, so a key missing from the output is
+    /// not "left alone" — it is reset to the default the next time anything
+    /// reads the file.
+    #[serde(skip_serializing_if = "is_false")]
+    log_file_names: bool,
+    /// The 4.2 keys. Each is skipped at its default, matching `ClientConfig`,
+    /// so saving a config that never touches them keeps it readable by
+    /// v0.5.4 — which would reject the whole file on an unknown key.
+    #[serde(skip_serializing_if = "is_default_send_mode")]
+    send_mode: SendMode,
+    #[serde(skip_serializing_if = "is_default_receive_mode")]
+    receive_mode: ReceiveMode,
+    #[serde(skip_serializing_if = "is_false")]
+    pickup_auto: bool,
+    #[serde(skip_serializing_if = "is_default_offer_ttl")]
+    offer_ttl_minutes: u32,
+    #[serde(skip_serializing_if = "is_default_pull_window")]
+    pull_window_chunks: u32,
+    #[serde(skip_serializing_if = "is_default_pull_idle_timeout")]
+    pull_idle_timeout_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     hub: Option<WritableHub<'a>>,
 }
@@ -522,10 +766,34 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Build the serializable shadow from the form.
+///
+/// Split out so the tests can assert on the *serialized* result without
+/// touching the filesystem, and so `write_toml` has exactly one place where
+/// form field → config key mapping lives.
+fn writable_config<'a>(form: &'a FormState, hub: Option<WritableHub<'a>>) -> WritableConfig<'a> {
+    let ca = form.tls_ca_file.trim();
+    WritableConfig {
+        server: &form.server,
+        user: &form.user,
+        password: &form.password,
+        poll_ms: form.poll_ms,
+        tls_ca_file: if ca.is_empty() { None } else { Some(ca) },
+        tls_insecure: form.tls_insecure,
+        log_file_names: form.log_file_names,
+        send_mode: form.send_mode,
+        receive_mode: form.receive_mode,
+        pickup_auto: form.pickup_auto,
+        offer_ttl_minutes: form.offer_ttl_minutes,
+        pull_window_chunks: form.pull_window_chunks,
+        pull_idle_timeout_secs: form.pull_idle_timeout_secs,
+        hub,
+    }
+}
+
 /// Write the form back as TOML, creating parent dirs and setting 0600
 /// on Unix (the file contains a password).
 fn write_toml(path: &Path, form: &FormState) -> Result<()> {
-    let ca = form.tls_ca_file.trim();
     let hub_cert = form.hub_tls_cert_file.trim();
     let hub_key = form.hub_tls_key_file.trim();
     let hub_section = if form.hub_enabled
@@ -554,15 +822,7 @@ fn write_toml(path: &Path, form: &FormState) -> Result<()> {
         None
     };
 
-    let writable = WritableConfig {
-        server: &form.server,
-        user: &form.user,
-        password: &form.password,
-        poll_ms: form.poll_ms,
-        tls_ca_file: if ca.is_empty() { None } else { Some(ca) },
-        tls_insecure: form.tls_insecure,
-        hub: hub_section,
-    };
+    let writable = writable_config(form, hub_section);
 
     let mut out =
         String::from("# clipboardwire client config — written by `clipboardwire settings`.\n\n");
@@ -602,8 +862,148 @@ mod tests {
             hub_password: String::new(),
             hub_tls_cert_file: String::new(),
             hub_tls_key_file: String::new(),
-            last_error: None,
+            ..FormState::default()
         }
+    }
+
+    /// Serialize the form exactly as `write_toml` would, without touching disk.
+    fn rendered(form: &FormState) -> String {
+        toml::to_string(&writable_config(form, None)).expect("serialize")
+    }
+
+    fn form_from_toml(raw: &str) -> FormState {
+        let cfg: ClientConfig = toml::from_str(raw).expect("parse");
+        // Mirror `load_or_default` field by field: the point of these tests is
+        // that a load → save round trip is lossless, so building the form by
+        // hand here would let a dropped field hide.
+        FormState {
+            server: cfg.server,
+            user: cfg.user,
+            password: cfg.password,
+            poll_ms: cfg.poll_ms,
+            tls_ca_file: cfg
+                .tls_ca_file
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            tls_insecure: cfg.tls_insecure,
+            log_file_names: cfg.log_file_names,
+            send_mode: cfg.send_mode,
+            receive_mode: cfg.receive_mode,
+            pickup_auto: cfg.pickup_auto,
+            offer_ttl_minutes: cfg.offer_ttl_minutes,
+            pull_window_chunks: cfg.pull_window_chunks,
+            pull_idle_timeout_secs: cfg.pull_idle_timeout_secs,
+            ..FormState::default()
+        }
+    }
+
+    const MINIMAL: &str = "server = \"ws://h/sync\"\nuser = \"u\"\npassword = \"p\"\n";
+
+    #[test]
+    fn settings_preserves_log_file_names() {
+        // The data-loss bug: `log_file_names` was absent from both the form and
+        // the writer, so any save reset it. `deny_unknown_fields` means the
+        // key is not "left alone" when omitted — the next reader sees the
+        // default.
+        let form = form_from_toml(&format!("{MINIMAL}log_file_names = true\n"));
+        assert!(form.log_file_names, "load must see the key");
+        let out = rendered(&form);
+        assert!(
+            out.contains("log_file_names = true"),
+            "save dropped it again:\n{out}"
+        );
+
+        // And it survives a full parse of what was written.
+        let reread: ClientConfig = toml::from_str(&out).unwrap();
+        assert!(reread.log_file_names);
+    }
+
+    #[test]
+    fn settings_preserves_explicit_modes() {
+        let form = form_from_toml(&format!(
+            "{MINIMAL}send_mode = \"lazy\"\nreceive_mode = \"pickup\"\n\
+             offer_ttl_minutes = 5\npull_window_chunks = 7\npull_idle_timeout_secs = 45\n"
+        ));
+        let out = rendered(&form);
+        for expected in [
+            "send_mode = \"lazy\"",
+            "receive_mode = \"pickup\"",
+            "offer_ttl_minutes = 5",
+            "pull_window_chunks = 7",
+            "pull_idle_timeout_secs = 45",
+        ] {
+            assert!(out.contains(expected), "{expected} missing from:\n{out}");
+        }
+        let reread: ClientConfig = toml::from_str(&out).unwrap();
+        assert_eq!(reread.send_mode, SendMode::Lazy);
+        assert_eq!(reread.receive_mode, ReceiveMode::Pickup);
+        assert_eq!(reread.offer_ttl_minutes, 5);
+    }
+
+    #[test]
+    fn settings_omits_default_modes() {
+        // A v0.5.4 binary parses with `deny_unknown_fields`, so a default
+        // written into the file would make it refuse the whole config.
+        let out = rendered(&valid_form());
+        for absent in [
+            "send_mode",
+            "receive_mode",
+            "pickup_auto",
+            "offer_ttl_minutes",
+            "pull_window_chunks",
+            "pull_idle_timeout_secs",
+            "log_file_names",
+        ] {
+            assert!(!out.contains(absent), "{absent} leaked into:\n{out}");
+        }
+        assert!(out.contains("server"));
+    }
+
+    #[test]
+    fn settings_refuses_paste_on_linux() {
+        let mut form = valid_form();
+        form.receive_mode = ReceiveMode::Paste;
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert!(validate(&form).is_ok(), "paste is supported here");
+            return;
+        }
+        let err = validate(&form).expect_err("paste must be refused here");
+        assert!(err.contains("pickup"), "must name the alternative: {err}");
+        assert!(err.contains("eager"), "{err}");
+    }
+
+    #[test]
+    fn settings_refuses_a_zero_ttl_and_an_oversized_window() {
+        // The GUI must enforce the same bounds `ClientConfig::load` does, or it
+        // happily writes a config the client then refuses to start with.
+        let mut form = valid_form();
+        form.offer_ttl_minutes = 0;
+        assert!(validate(&form).is_err());
+
+        let mut form = valid_form();
+        form.pull_window_chunks = 33;
+        assert!(validate(&form).is_err());
+
+        let mut form = valid_form();
+        form.pull_window_chunks = 0;
+        assert!(validate(&form).is_err());
+    }
+
+    #[test]
+    fn a_round_trip_through_the_form_loses_nothing() {
+        // The general shape of the bug: every writable key must come back.
+        let original = format!(
+            "{MINIMAL}poll_ms = 700\ntls_insecure = true\nlog_file_names = true\n\
+             send_mode = \"lazy\"\npickup_auto = true\n"
+        );
+        let form = form_from_toml(&original);
+        let out = rendered(&form);
+        let reloaded: ClientConfig = toml::from_str(&out).unwrap();
+        assert_eq!(reloaded.poll_ms, 700);
+        assert!(reloaded.tls_insecure);
+        assert!(reloaded.log_file_names);
+        assert_eq!(reloaded.send_mode, SendMode::Lazy);
+        assert!(reloaded.pickup_auto);
     }
 
     #[test]
