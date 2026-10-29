@@ -76,7 +76,7 @@ core/src/
 TLS comes from `axum-server` with the `tls-rustls` feature, plus `rustls`
 and `rustls-pemfile` for cert loading. **Not** used: any database crate, any
 session/cookie crate, any templating engine, any application-layer
-cryptography crate (no E2EE in v0.1). The server has zero persistent state.
+cryptography crate (no E2EE). The server has zero persistent state.
 
 ### 2.3 Concurrency model
 
@@ -158,9 +158,10 @@ admin/admin".
 ## 3. Clipboard client (`clipboardwire-core::client`)
 
 The client-side code lives in `clipboardwire-core` and is invoked by the CLI's
-`connect` subcommand (or as the other half of `host`). No GUI in v0.1; runs as
-a foreground process that logs to stderr and exits non-zero on fatal errors.
-Tray UI is a Phase-3+ follow-up.
+`connect` subcommand (or as the other half of `host`). Without `--tray` it runs
+headless as a foreground process that logs to stderr and exits non-zero on fatal
+errors; with `--tray` (the default for a desktop launch) the CLI owns the tray
+icon and settings dialog, both of which live in `cli/` rather than here.
 
 ### 3.1 Module layout
 
@@ -449,9 +450,16 @@ matches. Verification passes on a file neither side would have chosen.
 The protocol does not try to prevent that with the digest — it cannot, since the
 digest is computed from the same stream. It prevents it with the identity
 re-checks described in §3.9: each window re-stats the file, so a change between
-windows is caught by something other than the hash. What remains is the gap
-*between* a stat and the reads that follow it, and that is bounded by one window
-rather than by the whole file.
+windows is caught by something other than the hash.
+
+What remains is the gap *between* a stat and the reads that follow it. It is
+bounded by one window rather than by the whole file, but "one window" is not
+small: `MAX_PULL_WINDOW` is 32 chunks of 4 MiB, so a single window can be 128 MiB
+and on a slow disk can take tens of seconds to read. A writer that rewrites the
+file during that span can still produce a stream that hashes consistently. The
+bound is a bound on the *span*, not a claim that the span is short; closing it
+further would need a per-chunk identity check, which costs a stat per chunk on
+the read path.
 
 <!-- Phase 6/7: paste paths, pending spikes 0.1/0.2 -->
 
@@ -554,14 +562,22 @@ cargo generate-rpm -p clipboardwire                         # → target/generat
 sudo systemctl enable --now clipboardwire
 ```
 
-## 7. Out of scope for v0.1 (intentionally)
+## 7. Out of scope (intentionally)
 
-- Cross-platform tray UI on Linux/macOS (Windows ships in v0.1; Linux deferred
-  due to libgtk/libappindicator runtime deps that would either split the
-  Linux package or force a GTK dep on headless servers).
-- Image / file clipboard payloads (protocol bump required).
+Each of these is a deliberate boundary, not an unfinished task. The section
+name used to say "for v0.1"; the boundaries that have since moved are marked.
+
+- Cross-platform tray UI on **Linux** — deferred due to libgtk/libappindicator
+  runtime deps that would either split the Linux package or force a GTK dep on
+  headless servers. *(Windows and macOS both ship a tray; this entry is now
+  Linux-only.)*
+- Image clipboard payloads (protocol bump required). *(Files are no longer in
+  this list: v0.4 transfers them, eagerly or lazily — see §3.8–§3.11.)*
 - Multi-user / per-room separation.
-- TLS in the server (use a reverse proxy).
+- TLS terminated inside the server, rather than by a reverse proxy. *(The server
+  can now serve TLS directly with `tls_cert_file`/`tls_key_file` and generates a
+  self-signed certificate when none is configured; a reverse proxy remains the
+  recommended shape for a public deployment.)*
 - Application-layer encryption / TOFU device pairing (see `PROTOCOL.md` §4).
 - OS keyring integration for storing the Basic-auth password.
-- Persistent `last_clip` across restarts.
+- Persistent `last_clip` across restarts — the hub keeps it in memory only.
