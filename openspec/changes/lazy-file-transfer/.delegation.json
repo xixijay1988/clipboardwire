@@ -73,5 +73,22 @@
     "fix_dispatched": "cw-fix-lazy-save-dir: make None mean the platform default on both receive paths (prefer one shared resolution rather than two), keep the warn branch honest or delete it if unreachable, and add a regression test that deliberately does NOT pass save_dir and that fails when the fix is reverted."
   },
 
-  "next_action": "On cw-fix-lazy-save-dir result: verify the mutation myself, rebuild macOS + Windows artifacts, reinstall locally, and ask the user to retest. Also ask the user whether XS-OFFICE wrote a clipboardwire.log.2026-10-29 file (that log proves the exe starts at all, and separates a runtime failure from the save_dir defect) and whether WARN lines mention the offer/pull/fan-out path rather than 'no save dir'. Nothing gets reported as fixed until the new test fails without the fix."
+  "intermittent_copy_failure_investigation": {
+    "user_report": "Copying files sometimes fails.",
+    "loop": "/tmp/cw-repro2.sh plus /tmp/cw-setpb2 (Objective-C NSPasteboard writer, because osascript sets an alias record and pbcopy cannot carry public.file-url). Confirmed premise first with a direct probe: after deleting a file, `the clipboard as «class furl»` still names the dead path.",
+
+    "defect_1_dedup_swallows_recopy_of_a_changed_file": {
+      "mechanism": "clipboard.rs decide() dedupes on the path list alone: `if seen.files.as_deref() == Some(paths.as_slice()) { return None; }`. If the user copies a file, deletes or moves it, then copies the same path again, the paths are identical, so no ClipChange::Files is emitted, no offer is published, and NOTHING is logged. From the user's side the copy silently did nothing -- which is exactly the 'sometimes' shape.",
+      "evidence": "Reproduced with a real hub: two offers sent for a.txt and b.txt; after `rm b.txt` the same path was put back on the pasteboard and no third offer was sent, and no warning appeared.",
+      "why_dedup_exists": "It prevents re-publishing an unchanged file on every poll tick, which would mint a new file_id every 300 ms. The rule needs to distinguish 'same path, unchanged bytes' from 'same path, different bytes'. PinnedIdentity already makes that comparison possible at advertise time; the clipboard layer just never looks at it again."
+    },
+
+    "defect_2_statfailed_is_reported_but_not_surfaced": {
+      "mechanism": "When a path dies between the clipboard read and publish, advertise() returns SkipReason::StatFailed and the supervisor logs a redacted WARN. The user gets no visible feedback in the tray and the copy simply does not happen.",
+      "real_log": "2026-10-29T06:44:18 WARN skipping file in offer file=file#05b63e105a089643 reason=StatFailed(No such file or directory); repeated at 06:44:27 for the same id.",
+      "note": "The log evidence also shows this fired immediately after a reconnect (No route to host at 06:44:13), so it is not only user-driven deletion."
+    },
+
+    "next_action": "Dispatch one builder task for defect 1 (silent dedupe) with the repro above as the acceptance case, and one decision for defect 2 (whether a failed copy should be visible in the tray). Do not fix by hand: both live in core/src."
+  }
 }

@@ -35,6 +35,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
 use super::files_clipboard;
+use super::offer::PinnedIdentity;
 
 /// Default-buffer size for the outbound events channel.
 const EVENT_BUFFER: usize = 32;
@@ -66,6 +67,19 @@ struct Seen {
     text: Option<String>,
     image: Option<ImageBytes>,
     files: Option<Vec<PathBuf>>,
+    /// What the files behind `files` looked like when we last emitted them,
+    /// one entry per path (`None` = the path did not stat).
+    ///
+    /// This exists because a path list alone is not an identity. A user who
+    /// deletes a file and copies the same path again sends exactly the same
+    /// `Vec<PathBuf>`, so path-only dedupe swallowed the second copy silently:
+    /// no offer, no log, nothing. Comparing contents is what distinguishes
+    /// "the poll loop re-read an unchanged clipboard" from "the user copied
+    /// again".
+    ///
+    /// `None` means "we have no snapshot" — set when the list changes and
+    /// filled in immediately afterwards by [`record_files_identity`].
+    files_identity: Option<Vec<Option<PinnedIdentity>>>,
     files_err_streak: u32,
     files_absent_streak: u32,
 }
@@ -106,6 +120,11 @@ impl Seen {
             }
             ClipChange::Files(p) => {
                 self.files = Some(p.clone());
+                // Stat what we just wrote. The point is echo suppression: the
+                // very next tick reports these same paths, and without a
+                // snapshot the recheck would have to assume "changed" and
+                // bounce the files straight back to the hub.
+                self.files_identity = Some(identities_of(p));
                 self.text = None;
                 self.image = None;
                 self.files_absent_streak = 0;
@@ -132,6 +151,54 @@ enum TextRead {
     Error,
 }
 
+/// Stat every path, keeping the failures as `None`.
+///
+/// Called only when the path list actually needs an identity — a change, or a
+/// same-list recheck — so the steady state (a poll re-reading an unchanged
+/// clipboard) still costs zero stats in `decide` itself. See
+/// [`record_files_identity`].
+fn identities_of(paths: &[PathBuf]) -> Vec<Option<PinnedIdentity>> {
+    paths
+        .iter()
+        .map(|path| PinnedIdentity::of(path).ok())
+        .collect()
+}
+
+/// Refresh `seen.files_identity` for the current path list.
+///
+/// Separate from [`decide`] because the decision is a pure function over its
+/// inputs and this is the one part that must touch the filesystem. The poll
+/// loop calls it exactly when `decide` says the list is unchanged but should be
+/// rechecked.
+fn record_files_identity(seen: &mut Seen) {
+    if let Some(paths) = seen.files.clone() {
+        seen.files_identity = Some(identities_of(&paths));
+    }
+}
+
+/// What a poll tick concluded about the files representation.
+///
+/// A bare `Option<ClipChange>` cannot express the case this type exists for:
+/// "the path list is identical, but the files behind it may have changed". That
+/// third state is what a deleted-then-recopied file produces, and collapsing it
+/// to `None` is the bug this replaces.
+#[derive(Debug)]
+enum FilesDecision {
+    /// The list differs from the last one — emit it.
+    Changed(Vec<PathBuf>),
+    /// The list is identical. `stale` is true when the files behind it no
+    /// longer match the snapshot taken when they were emitted, i.e. the user
+    /// re-copied something we would otherwise ignore.
+    Same { stale: bool },
+    /// Files still occupy the clipboard but this tick has nothing to say:
+    /// **emit nothing at all**, not even image/text. Their shadow
+    /// representations (a Finder icon TIFF, the filename as text) would
+    /// otherwise ride the wire behind the file list.
+    Suppress,
+    /// Files no longer occupy the clipboard; image/text may flow.
+    Quiet,
+}
+
 /// Decide which [`ClipChange`] (if any) a poll tick should emit, given
 /// the raw backend reads and the running [`Seen`] state. Pure function
 /// over explicit inputs so the policy is testable without arboard.
@@ -149,19 +216,96 @@ fn decide(
     image: Option<ImageBytes>,
     text: TextRead,
 ) -> Option<ClipChange> {
-    match files {
-        FilesRead::Files(paths) => {
-            seen.files_err_streak = 0;
-            seen.files_absent_streak = 0;
-            if seen.files.as_deref() == Some(paths.as_slice()) {
-                return None;
-            }
-            seen.files = Some(paths.clone());
+    match decide_files(seen, files) {
+        FilesDecision::Changed(paths) => {
             // New clipboard state: reset the other trackers so a later
             // identical icon/name isn't deduped away.
             seen.image = None;
             seen.text = None;
             return Some(ClipChange::Files(paths));
+        }
+        FilesDecision::Same { stale: true } => {
+            // The path list is identical but the files behind it are not what
+            // we advertised. That is a *re-copy*, and the user expects an
+            // offer for it — silently swallowing it was the "sometimes copying
+            // does nothing" bug. Emit the same list; `OfferRegistry::advertise`
+            // decides whether it can reuse the `file_id` (same bytes) or must
+            // supersede it (different bytes, or gone).
+            let paths = seen.files.clone().unwrap_or_default();
+            seen.image = None;
+            seen.text = None;
+            return Some(ClipChange::Files(paths));
+        }
+        FilesDecision::Same { stale: false } => {
+            // Unchanged clipboard: the steady state this dedupe exists for.
+            // Still a suppression, not a fall-through: the files are on the
+            // clipboard, so their shadow representations must not escape.
+            return None;
+        }
+        FilesDecision::Suppress => return None,
+        FilesDecision::Quiet => {}
+    }
+    decide_not_files(seen, image, text)
+}
+
+/// Files half of [`decide`]: classify the file list without touching the
+/// image/text trackers, so the caller can decide what a change means.
+///
+/// Pure. The identity comparison uses the snapshot in `Seen`, which the poll
+/// loop refreshes via [`record_files_identity`] — this function never stats.
+fn decide_files(seen: &mut Seen, files: FilesRead) -> FilesDecision {
+    match files {
+        FilesRead::Files(paths) => {
+            seen.files_err_streak = 0;
+            seen.files_absent_streak = 0;
+            if seen.files.as_deref() == Some(paths.as_slice()) {
+                // Same list. Whether this is a no-op or a re-copy depends on
+                // the files' identities, not on their names — a delete and
+                // re-copy of one path produces an identical list.
+                // "Stale" means the files behind this list are not what we
+                // last saw — a *transition*, not a state. The distinction
+                // matters for the deleted case: reporting a missing file once
+                // is the visible signal the user needs; reporting it on every
+                // 300 ms tick for as long as the clipboard holds that path
+                // would bury the log.
+                let stale = match seen.files_identity.as_ref() {
+                    Some(snapshot) => snapshot.iter().zip(paths.iter()).any(|(was, path)| {
+                        match (was, PinnedIdentity::of(path)) {
+                            // Both readable: compare contents, not names.
+                            (Some(before), Ok(now)) => before != &now,
+                            // Present -> missing. A real transition: the user
+                            // deleted the file the clipboard still points at.
+                            // `publish_offers` answers `StatFailed`, which is
+                            // the one visible signal this path has.
+                            (Some(_), Err(_)) => true,
+                            // Missing -> present: a new file at the same path.
+                            (None, Ok(_)) => true,
+                            // Missing -> still missing. Already reported; a
+                            // re-copy of a path that does not exist cannot
+                            // produce an offer, and repeating the warning
+                            // every tick would be noise.
+                            (None, Err(_)) => false,
+                        }
+                    }),
+                    // No snapshot at all. Should not happen (every path that
+                    // sets `seen.files` also sets `files_identity`), but if it
+                    // does, emitting is the safe direction — the next tick has
+                    // a snapshot again.
+                    None => true,
+                };
+                if stale {
+                    // Re-snapshot as part of the transition, so this reports
+                    // the change **once**. Doing it in the caller instead left
+                    // the snapshot on the old value and re-reported every tick:
+                    // ~3 warnings a second for as long as the clipboard held a
+                    // path that no longer exists.
+                    record_files_identity(seen);
+                }
+                return FilesDecision::Same { stale };
+            }
+            seen.files = Some(paths.clone());
+            seen.files_identity = Some(identities_of(&paths));
+            return FilesDecision::Changed(paths);
         }
         FilesRead::NoFiles => {
             seen.files_err_streak = 0;
@@ -172,9 +316,10 @@ fn decide(
                     // lone empty read is likely the backend catching a
                     // mid-rewrite. Releasing here would let the shadow
                     // icon/name escape over the wire.
-                    return None;
+                    return FilesDecision::Suppress;
                 }
                 seen.files = None;
+                seen.files_identity = None;
             } else {
                 seen.files_absent_streak = 0;
             }
@@ -185,14 +330,26 @@ fn decide(
                 // Transient failure while files still sit on the
                 // clipboard — skip the tick rather than risk emitting
                 // the shadow icon/name representations.
-                return None;
+                return FilesDecision::Suppress;
             }
             if seen.files_err_streak > MAX_FILES_READ_ERRORS {
                 seen.files = None;
+                seen.files_identity = None;
             }
         }
     }
+    FilesDecision::Quiet
+}
 
+/// Image-then-text half of [`decide`], run only when files produced nothing.
+///
+/// Split out so the files classifier can return without threading the other
+/// two trackers through a function that has no business touching them.
+fn decide_not_files(
+    seen: &mut Seen,
+    image: Option<ImageBytes>,
+    text: TextRead,
+) -> Option<ClipChange> {
     // Image: on most platforms the image clipboard slot is distinct
     // from the text slot, and screenshots are the common "I want this on
     // another machine" case. We still check text every tick.
@@ -729,6 +886,136 @@ mod tests {
             TextRead::Value("report.docx".into()),
         );
         assert_eq!(out, Some(ClipChange::Image(icon())));
+    }
+
+    // ---- Same paths, but different files (the "sometimes nothing happens" bug) ----
+
+    /// A real file in a fresh temp dir, so identity comparisons are about
+    /// actual inodes rather than fabricated paths.
+    fn real_file(label: &str, body: &[u8]) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("cw-clip-decide-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.bin");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// A poll tick with the given file list, nothing else on the clipboard.
+    fn tick(seen: &mut Seen, paths: Vec<PathBuf>) -> Option<ClipChange> {
+        decide(seen, FilesRead::Files(paths), None, TextRead::Error)
+    }
+
+    #[test]
+    fn an_unchanged_path_list_is_not_republished() {
+        // The dedupe this all exists for: the poll loop re-reads the same
+        // clipboard every 300 ms. Each tick must NOT mint a new `file_id`.
+        let file = real_file("steady", b"steady contents");
+        let mut seen = Seen::default();
+
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()])),
+            "the first tick must emit"
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                tick(&mut seen, vec![file.clone()]),
+                None,
+                "an unchanged file must not be re-published"
+            );
+        }
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_deleted_file_recopied_at_the_same_path_is_not_silently_dropped() {
+        // The reported bug. Copy a file, delete it (the clipboard still points
+        // at the path — confirmed on macOS), copy the same path again. The list
+        // is byte-identical to the last one, so path-only dedupe swallowed it:
+        // no offer, no log, nothing. The user saw "copying does nothing".
+        let file = real_file("deleted", b"first contents");
+        let mut seen = Seen::default();
+
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()])),
+            "the first copy emits"
+        );
+        assert_eq!(tick(&mut seen, vec![file.clone()]), None, "steady state");
+
+        std::fs::remove_file(&file).unwrap();
+
+        // The path is gone. This must not be silent: emitting hands the list
+        // to `publish_offers`, which answers `StatFailed` — the only visible
+        // signal the deletion can produce.
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()])),
+            "a disappeared file must produce a visible outcome, not silence"
+        );
+
+        // And it must be reported *once*, not on every 300 ms tick while the
+        // clipboard still holds that path.
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            None,
+            "an already-reported disappearance must not repeat every tick"
+        );
+
+        // Recreate it: the path is back and now names a real file again.
+        std::fs::write(&file, b"second contents").unwrap();
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()])),
+            "a reappearing file at the same path is a new copy"
+        );
+
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_rewritten_file_at_the_same_path_is_republished() {
+        // Same path, different bytes. `OfferRegistry::advertise` supersedes the
+        // old `file_id` when it sees this; it can only do that if the clipboard
+        // layer stops swallowing the re-copy.
+        let file = real_file("rewritten", b"version one");
+        let mut seen = Seen::default();
+
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()]))
+        );
+        assert_eq!(tick(&mut seen, vec![file.clone()]), None, "steady state");
+
+        // Same length so only the content, and therefore only the identity
+        // (mtime), can reveal this — a length-only check would miss it.
+        std::fs::write(&file, b"version TWO").unwrap();
+        // Force a strictly different mtime; some filesystems have coarse
+        // timestamps and the two writes can land in the same tick.
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            Some(ClipChange::Files(vec![file.clone()])),
+            "rewritten contents at the same path must be re-published"
+        );
+        assert_eq!(
+            tick(&mut seen, vec![file.clone()]),
+            None,
+            "and then settle back into steady state"
+        );
+
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     /// A Files read between absent ticks resets the streak — only

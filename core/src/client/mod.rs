@@ -787,11 +787,60 @@ pub async fn run_supervisor_with_policy(
                                 &transport.outbound_control_tx,
                             );
                             for (path, reason) in skipped {
-                                warn!(
-                                    file = %crate::logging::redact_path(&path, log_file_names),
-                                    reason = ?reason,
-                                    "skipping file in offer"
+                                // A skipped path is the difference between
+                                // "I copied a file" and "a file left this
+                                // machine", and it was previously visible only
+                                // in the log file. The tray already renders a
+                                // `Failed` transfer as "failed to send <name>"
+                                // and counts it in the menu header, so report
+                                // it there instead of inventing a second
+                                // notification path.
+                                let display_name = crate::logging::redact_file_name(
+                                    &path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string()),
+                                    log_file_names,
                                 );
+                                if let Some(tx) = progress_tx.as_ref() {
+                                    let _ = tx.send(TransferProgress {
+                                        // No offer was minted, so there is no
+                                        // `file_id`; a fresh one keeps two
+                                        // skipped files of the same name from
+                                        // collapsing into one tray row.
+                                        file_id: TransferId::new_v4(),
+                                        transfer_id: None,
+                                        direction: Direction::Send,
+                                        peer: None,
+                                        name: display_name,
+                                        bytes_done: 0,
+                                        bytes_total: 0,
+                                        state: ProgressState::Failed,
+                                    });
+                                }
+                                match reason {
+                                    offer::SkipReason::StatFailed(ref detail) => {
+                                        // The user-visible symptom of the
+                                        // delete-then-recopy path: the
+                                        // clipboard names a file that is no
+                                        // longer there. ERROR rather than WARN
+                                        // because nothing was sent and the
+                                        // tray line will not say why.
+                                        error!(
+                                            file = %crate::logging::redact_path(&path, log_file_names),
+                                            reason = %detail,
+                                            "could not offer a file: it cannot be read; \
+                                             re-copy it after the file exists again"
+                                        );
+                                    }
+                                    other => {
+                                        warn!(
+                                            file = %crate::logging::redact_path(&path, log_file_names),
+                                            reason = ?other,
+                                            "skipping file in offer"
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             if send_policy.mode == SendMode::Lazy && !lazy_downgrade_warned {
@@ -1620,6 +1669,103 @@ mod tests {
         assert!(
             outbound_rx.try_recv().is_err(),
             "lazy mode must not emit a clip either"
+        );
+
+        drop(events_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_is_reported_to_the_tray() {
+        // The user-visible half of "sometimes copying a file does nothing".
+        // The clipboard can name a path that no longer exists (a delete
+        // followed by a re-copy keeps the same path), and `publish_offers`
+        // answers `StatFailed`. Before this, that answer existed only in the
+        // log file: the tray showed nothing, so the failure looked like the
+        // app ignoring the copy.
+        let dir = unique_dir("unreadable");
+        let missing = dir.join("already-deleted.bin");
+        // Deliberately not created: this is the shape the clipboard is in after
+        // the file is deleted while its path stays on the pasteboard.
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+        let (apply_tx, _apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<ClipFrame>(8);
+        let (outbound_files_tx, _outbound_files_rx) =
+            tokio::sync::mpsc::channel::<crate::protocol::FileChunkFrame>(8);
+        let (outbound_control_tx, mut outbound_control_rx) = tokio::sync::mpsc::channel::<Frame>(8);
+        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<ClipFrame>(8);
+        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Caps::LAZY_FILE);
+
+        let (progress_tx, mut progress_rx) = tokio::sync::broadcast::channel::<TransferProgress>(8);
+
+        let supervisor = tokio::spawn(run_supervisor_with_policy(
+            Clipboard {
+                events_rx,
+                apply_tx,
+            },
+            Transport {
+                inbound_rx,
+                inbound_files_rx: None,
+                outbound_tx,
+                outbound_files_tx,
+                inbound_control_rx: None,
+                outbound_control_tx,
+                hub_caps,
+            },
+            Some(progress_tx),
+            false,
+            None,
+            SendPolicy {
+                mode: SendMode::Lazy,
+                offer_ttl_ms: 60_000,
+                ..SendPolicy::default()
+            },
+            ReceivePolicy::default(),
+        ));
+
+        events_tx
+            .send(ClipChange::Files(vec![missing.clone()]))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), progress_rx.recv())
+            .await
+            .expect("a failed offer must surface as a progress event")
+            .expect("progress channel open");
+
+        assert_eq!(
+            event.state,
+            ProgressState::Failed,
+            "the tray renders `Failed` as a visible failure row"
+        );
+        assert_eq!(event.direction, Direction::Send);
+        // `TransferProgress.name` is redacted unless `log_file_names` is on —
+        // the same rule `file.rs` applies (`TRANSFER_PROGRESS` goes to the tray
+        // tooltip, which is a log surface in every sense that matters). What
+        // has to hold here is that it is non-empty and derived from the file,
+        // not that it is the raw name.
+        assert!(
+            !event.name.is_empty(),
+            "the row must identify a file, not render blank"
+        );
+        assert!(
+            event.name.starts_with("file#") || event.name == "already-deleted.bin",
+            "unexpected name rendering: {}",
+            event.name
+        );
+        assert!(
+            event.summary_line(40).starts_with("failed to send"),
+            "the tray line comes from `summary_line`: {}",
+            event.summary_line(40)
+        );
+
+        // Nothing was offered: a missing file must not become an offer that no
+        // peer can ever pull.
+        assert!(
+            outbound_control_rx.try_recv().is_err(),
+            "a file that cannot be read must not be advertised"
         );
 
         drop(events_tx);
