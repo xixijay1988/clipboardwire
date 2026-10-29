@@ -103,6 +103,51 @@ pub struct Transport {
     pub hub_caps: watch::Receiver<Caps>,
 }
 
+impl Transport {
+    /// Close the outbound half, then wait for the transport task to finish.
+    ///
+    /// This is what a **one-shot sender** does when it has queued everything it
+    /// intends to send. The transport task's `select!` ends the connection when
+    /// any outbound channel closes (`connect_and_serve`, "outbound clips
+    /// closed"), and it then drains whatever is still queued
+    /// (`drain_and_finish`) before returning.
+    ///
+    /// `let _ = transport.outbound_tx;` does **not** do this. `let _ = expr`
+    /// evaluates and discards *the value's place*, not the value: the
+    /// `mpsc::Sender` stays alive inside `transport`, so no channel ever
+    /// closes, the select never sees `None`, and a one-shot `send` hangs until
+    /// the user presses Ctrl-C. Consuming `self` makes the drop unconditional
+    /// and impossible to get wrong at the call site.
+    ///
+    /// The inbound receivers are dropped too: nothing will read them once the
+    /// task is gone, and holding them open would keep the inbound senders in
+    /// the task alive for no reason.
+    pub async fn close_outbound(self, join: tokio::task::JoinHandle<()>) -> Result<()> {
+        let Transport {
+            inbound_rx,
+            inbound_files_rx,
+            outbound_tx,
+            outbound_files_tx,
+            inbound_control_rx,
+            outbound_control_tx,
+            hub_caps,
+        } = self;
+        // Explicit, one statement per channel: a reader has to be able to see
+        // that every sender really dies here.
+        drop(outbound_tx);
+        drop(outbound_files_tx);
+        drop(outbound_control_tx);
+        drop(inbound_rx);
+        drop(inbound_files_rx);
+        drop(inbound_control_rx);
+        drop(hub_caps);
+
+        join.await
+            .map_err(|e| anyhow!("transport task panicked: {e}"))?;
+        Ok(())
+    }
+}
+
 /// Configuration for [`spawn_with_options`]. Optional flags layered on
 /// top of the bare [`spawn`] call so the supervisor + a one-shot `send`
 /// subprocess can share the same transport code without each having

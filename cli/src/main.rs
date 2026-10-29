@@ -231,16 +231,20 @@ async fn run_send_once(
         clipboardwire_core::client::file::send_file_through(file, &transport.outbound_files_tx)
             .await;
 
-    // Drop the senders so the transport's run_loop sees the channels
-    // close and exits cleanly (one_shot=true skips the reconnect retry).
-    // The receiver-side channels go too, which closes the inbound side
-    // and lets the WebSocket peer's read loop see a clean stream end.
-    let _ = transport.outbound_tx;
-    let _ = transport.outbound_files_tx;
-    drop(transport.inbound_rx);
-    drop(transport.inbound_files_rx);
-    // Wait for the spawned task to finish flushing chunks to the wire.
-    join.await.context("transport task panicked")?;
+    // Consume the `Transport` so every sender really is dropped, then wait for
+    // the task to flush what is still queued and close the socket
+    // (`one_shot = true` makes it skip the reconnect retry).
+    //
+    // This used to be `let _ = transport.outbound_tx;`, which does **not**
+    // drop anything: `let _ = expr` discards the place, not the value, so the
+    // sender stayed alive inside `transport`, the transport's `select!` never
+    // saw its channel close, and `clipboardwire send` hung after the file had
+    // been delivered. `close_outbound` takes `self`, so the drop cannot be
+    // skipped.
+    transport
+        .close_outbound(join)
+        .await
+        .context("transport task panicked")?;
 
     send_result
 }
