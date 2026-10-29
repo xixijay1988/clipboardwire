@@ -39,7 +39,7 @@ impl PinnedIdentity {
     pub fn of(path: &Path) -> std::io::Result<Self> {
         let meta = std::fs::metadata(path)?;
         Ok(Self {
-            file_key: file_key(&meta),
+            file_key: file_key(path),
             size: meta.len(),
             mtime_ns: mtime_ns(&meta),
         })
@@ -59,26 +59,60 @@ impl PinnedIdentity {
     }
 }
 
+/// The platform's stable file identity, as `(volume, index)`.
+///
+/// Takes the **path**, not a `Metadata`, because the most useful identity on
+/// Windows is not reachable from `Metadata` at all: see the Windows
+/// implementation.
+///
+/// This is a second `open` on Windows, not a reuse of the `stat` that
+/// `PinnedIdentity::of` already did. That is the price of a real identity
+/// rather than a best-effort one, and it happens once per offered file, not
+/// per served window (`still_matches` re-stats, and on Windows re-opens).
 #[cfg(unix)]
-fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn file_key(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
+    // Stat again rather than plumbing the caller's `Metadata` through: on Unix
+    // the extra stat is a no-op relative to the file-system identity check the
+    // caller just performed, and one signature for all platforms beats two.
+    let meta = std::fs::metadata(path).ok()?;
     Some((meta.dev(), meta.ino()))
 }
 
 #[cfg(windows)]
-fn file_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    // `volume_serial_number` and `file_index` are both `Option` on the
-    // `MetadataExt` trait: a filesystem that cannot supply them (some network
-    // shares) yields `None`, and then only size + mtime guard the offer.
-    match (meta.volume_serial_number(), meta.file_index()) {
-        (Some(volume), Some(index)) => Some((volume as u64, index)),
-        _ => None,
+fn file_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    // `std::os::windows::fs::MetadataExt::volume_serial_number` and
+    // `::file_index` would be the obvious way to get these two numbers, and an
+    // earlier version of this function used them. They are **not usable**: both
+    // are gated behind the unstable `windows_by_handle` feature (rust issue
+    // #63010), so referring to them fails to compile on stable — the note that
+    // used to sit here claiming they were ordinary `Option`-returning methods
+    // described an API that does not exist on any released toolchain.
+    //
+    // `GetFileInformationByHandle` is the stable equivalent. It needs a handle,
+    // hence the signature change to take the path.
+    let file = std::fs::File::open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable, correctly-typed out-parameter owned
+    // by this frame, and `handle` is a live file handle for the duration of the
+    // call (`file` is not dropped until after it returns).
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        // Some filesystems (SMB shares without the right extensions, some
+        // virtual filesystems) fail this call. `None` is the honest answer.
+        return None;
     }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((u64::from(info.dwVolumeSerialNumber), index))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_key(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn file_key(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -96,10 +130,18 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i128 {
     // since` yields `Err` for pre-1970 stamps; those become a large negative
     // value rather than panicking, and a file that old is still comparable
     // against its own earlier reading.
+    // `as_nanos()` is `u128` and there is no `i128: From<u128>`: a span that
+    // long is not representable, so it saturates. In practice this branch is
+    // unreachable — a `SystemTime` more than 5×10^21 years from the epoch cannot
+    // exist — but reporting a saturated value beats a `panic!` in a `stat`
+    // helper that runs on every offered file.
+    fn saturating_nanos(d: std::time::Duration) -> i128 {
+        i128::try_from(d.as_nanos()).unwrap_or(i128::MAX)
+    }
     match meta.modified() {
         Ok(time) => match time.duration_since(std::time::UNIX_EPOCH) {
-            Ok(after) => i128::from(after.as_nanos()),
-            Err(before) => -i128::from(before.duration().as_nanos()),
+            Ok(after) => saturating_nanos(after),
+            Err(before) => -saturating_nanos(before.duration()),
         },
         Err(_) => 0,
     }

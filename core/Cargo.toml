@@ -50,6 +50,14 @@ x11-clipboard = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
+# `GetFileInformationByHandle`, for the `(volume, file index)` half of a
+# pinned identity. `std::os::windows::fs::MetadataExt` cannot supply either
+# number on stable: `volume_serial_number` and `file_index` are behind the
+# `windows_by_handle` feature, still unstable (rust issue #63010).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -349,8 +349,15 @@ mod tests {
     fn the_file_is_not_written_twice_on_a_second_load() {
         let dir = unique_dir("no-rewrite");
         let first = load_or_create(&dir).unwrap();
-        let path = dir.join(IDENTITY_FILE);
-        let inode_before = inode_of(&path);
+        // Gated, not just the assertion below: `inode_of` itself only exists on
+        // Unix, so calling it unconditionally made this whole test module fail
+        // to compile for Windows targets.
+        #[cfg(unix)]
+        let (path, inode_before) = {
+            let path = dir.join(IDENTITY_FILE);
+            let inode = inode_of(&path);
+            (path, inode)
+        };
 
         // `load_or_create` writes atomically (temp file + rename), so a rewrite
         // necessarily produces a **different inode**. Comparing content would
@@ -366,8 +373,6 @@ mod tests {
             inode_before,
             "a matching identity must be read, never rewritten"
         );
-        #[cfg(not(unix))]
-        let _ = inode_before;
         assert!(
             !dir.join(format!("{IDENTITY_FILE}{TMP_SUFFIX}")).exists(),
             "no temp file may be left behind"

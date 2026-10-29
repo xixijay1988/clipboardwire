@@ -1073,6 +1073,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.7",
+ "windows-sys 0.59.0",
  "x11-clipboard",
 ]
 
