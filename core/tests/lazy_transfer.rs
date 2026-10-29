@@ -26,7 +26,14 @@ use clipboardwire_core::client::pull::{PullOutcome, PullServer, MAX_ACTIVE_PULLS
 use clipboardwire_core::client::receive::{
     ChunkOutcome, DigestOutcome, LazyAssembler, ReceiveEngine, StaleReason,
 };
+use clipboardwire_core::client::{
+    run_supervisor_with_policy, ClientConfig, ClientStatus, ClipChange, Clipboard, ReceiveMode,
+    ReceivePolicy, SendMode, SendPolicy,
+};
 use clipboardwire_core::protocol::{FilePullFrame, Frame, FILE_CHUNK_BYTES, MAX_PULL_WINDOW};
+use clipboardwire_core::server::{build_app, ServerConfig};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 const NOW: i64 = 1_700_000_000_000;
@@ -569,4 +576,224 @@ fn a_full_lazy_transfer_delivers_bytes_exactly() {
 
     let _ = fs::remove_dir_all(&source_dir);
     let _ = fs::remove_dir_all(&save_dir);
+}
+
+// ---- Phase 8.8: the whole chain, through a real hub over real WebSockets ----
+
+/// A hub config shaped like the one `file_transfer.rs` uses.
+fn server_cfg(addr: std::net::SocketAddr) -> ServerConfig {
+    ServerConfig {
+        bind: addr,
+        user: "alice".into(),
+        password: "hunter2".into(),
+        max_conns: 8,
+        max_frame_bytes: 16 * 1024 * 1024,
+        tls_cert_file: None,
+        tls_key_file: None,
+        tls_disabled: true,
+        state_dir: None,
+        stats: None,
+    }
+}
+
+fn client_cfg(addr: std::net::SocketAddr) -> ClientConfig {
+    ClientConfig {
+        server: format!("ws://{addr}/sync"),
+        user: "alice".into(),
+        password: "hunter2".into(),
+        poll_ms: 1000,
+        tls_ca_file: None,
+        tls_insecure: false,
+        hub: None,
+        log_file_names: false,
+        send_mode: SendMode::Lazy,
+        receive_mode: ReceiveMode::Pickup,
+        pickup_auto: false,
+        offer_ttl_minutes: 30,
+        pull_window_chunks: 2,
+        pull_idle_timeout_secs: 30,
+    }
+}
+
+/// Wait until a transport reports `Connected`.
+async fn wait_connected(rx: &mut watch::Receiver<ClientStatus>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if matches!(*rx.borrow_and_update(), ClientStatus::Connected) {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("transport never reported Connected");
+        }
+        if rx.changed().await.is_err() {
+            panic!("status channel closed before Connected");
+        }
+    }
+}
+
+/// Poll for a file to appear in `dir`, up to `timeout`.
+///
+/// Polling rather than a fixed sleep: the transfer spans two supervisors, a hub,
+/// four websockets and a pull round trip per window, so any fixed delay is
+/// either flaky or needlessly slow.
+async fn wait_for_landed_file(dir: &Path, timeout: std::time::Duration) -> PathBuf {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                // The assembler writes `<file_id>.partial` while in flight.
+                if name.to_string_lossy().ends_with(".partial") {
+                    continue;
+                }
+                if path.is_file() {
+                    return path;
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("no file landed in {} within {timeout:?}", dir.display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// The test the other lazy tests cannot be: **everything, over the wire**.
+///
+/// `a_full_lazy_transfer_delivers_bytes_exactly` deliberately wires
+/// `PullServer` straight to `ReceiveEngine`, which is what makes it
+/// deterministic — and what let the missing offer fan-out survive 433 tests,
+/// because no hub was on the path. This one starts a real hub, connects two
+/// real supervisors over real WebSockets, and only passes if the bytes arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lazy_transfer_crosses_a_real_hub_byte_exactly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (app, _hub_join) = build_app(server_cfg(addr));
+    let _server_task = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    // -- Receiver: pickup mode, sandboxed save dir. --
+    let recv_dir = unique_dir("hub-e2e-recv");
+    let (recv_status_tx, mut recv_status_rx) = watch::channel(ClientStatus::Connecting);
+    let (recv_transport, recv_join) = clipboardwire_core::client::transport::spawn_with_options(
+        client_cfg(addr),
+        clipboardwire_core::client::transport::SpawnOptions {
+            status_tx: Some(recv_status_tx),
+            receive_files: true,
+            one_shot: false,
+            device: Some(Uuid::new_v4()),
+            caps: clipboardwire_core::protocol::Caps::LAZY_FILE,
+        },
+    );
+    let (recv_events_tx, recv_events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+    let (recv_apply_tx, _recv_apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+    let recv_supervisor = tokio::spawn(run_supervisor_with_policy(
+        Clipboard {
+            events_rx: recv_events_rx,
+            apply_tx: recv_apply_tx,
+        },
+        recv_transport,
+        None,
+        false,
+        Some(recv_dir.clone()),
+        SendPolicy {
+            mode: SendMode::Eager,
+            ..SendPolicy::default()
+        },
+        ReceivePolicy {
+            mode: ReceiveMode::Pickup,
+            pull_window_chunks: 2,
+            save_dir: Some(recv_dir.clone()),
+        },
+    ));
+    wait_connected(&mut recv_status_rx).await;
+
+    // -- Sender: lazy mode, with its own control channel observed. --
+    let (send_status_tx, mut send_status_rx) = watch::channel(ClientStatus::Connecting);
+    let (send_transport, send_join) = clipboardwire_core::client::transport::spawn_with_options(
+        client_cfg(addr),
+        clipboardwire_core::client::transport::SpawnOptions {
+            status_tx: Some(send_status_tx),
+            // **Must be true.** A lazy source still has to *receive*
+            // `file_pull` frames to serve them, and those arrive on the
+            // control channel this flag creates. `run_with_status` passes
+            // `true` for the same reason; a real sender that set `false`
+            // would advertise `lazy-file` and then answer nothing.
+            receive_files: true,
+            one_shot: false,
+            device: Some(Uuid::new_v4()),
+            caps: clipboardwire_core::protocol::Caps::LAZY_FILE,
+        },
+    );
+
+    let (send_events_tx, send_events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+    let (send_apply_tx, _send_apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+    let send_supervisor = tokio::spawn(run_supervisor_with_policy(
+        Clipboard {
+            events_rx: send_events_rx,
+            apply_tx: send_apply_tx,
+        },
+        send_transport,
+        None,
+        false,
+        None,
+        SendPolicy {
+            mode: SendMode::Lazy,
+            offer_ttl_ms: 60_000,
+            ..SendPolicy::default()
+        },
+        ReceivePolicy {
+            mode: ReceiveMode::Eager,
+            ..ReceivePolicy::default()
+        },
+    ));
+    wait_connected(&mut send_status_rx).await;
+
+    // Both sides are connected and their supervisors are looping. `Connected`
+    // is emitted inside `connect_and_serve` *before* it consumes the welcome and
+    // enters its select loop, so give the loops a couple of poll ticks.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // -- Copy a multi-chunk file on the sender. --
+    let src_dir = unique_dir("hub-e2e-src");
+    let src = write_source(&src_dir, "crosshub.bin", multi_chunk_size());
+    let expected = fs::read(&src).unwrap();
+    send_events_tx
+        .send(ClipChange::Files(vec![src.clone()]))
+        .await
+        .unwrap();
+
+    // -- The receiver must land identical bytes. --
+    let landed = wait_for_landed_file(&recv_dir, std::time::Duration::from_secs(20)).await;
+    let received = fs::read(&landed).expect("the landed file is readable");
+
+    assert_eq!(
+        received.len(),
+        expected.len(),
+        "size mismatch: got {} bytes, expected {}",
+        received.len(),
+        expected.len()
+    );
+    assert_eq!(
+        received, expected,
+        "the lazy transfer must land byte-for-byte through a real hub"
+    );
+
+    // Cleanup: drop the senders so the supervisors observe closed channels and
+    // return, then stop the tasks.
+    drop(send_events_tx);
+    drop(recv_events_tx);
+    send_supervisor.abort();
+    recv_supervisor.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_join).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), recv_join).await;
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&recv_dir);
 }

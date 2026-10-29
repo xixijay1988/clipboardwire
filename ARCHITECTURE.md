@@ -166,10 +166,15 @@ Tray UI is a Phase-3+ follow-up.
 
 ```
 core/src/client/
-├── mod.rs           # `pub async fn run(config: ClientConfig) -> Result<()>`
+├── mod.rs           # supervisor: `run_with_status`, SendPolicy/ReceivePolicy
 ├── config.rs        # ClientConfig struct + TOML loader
 ├── transport.rs     # WS connect, auth, reconnect with backoff, framed I/O
-└── clipboard.rs     # arboard wrapper, polling loop, dedup of self-set values
+├── clipboard.rs     # arboard wrapper, polling loop, dedup of self-set values
+├── file.rs          # eager chunk writer (`FileReceiver`) + `finish_lazy_transfer`
+├── offer.rs         # source-side offer registry, pinned identity (§3.9)
+├── pull.rs          # source-side pull server: windows, hashing, digest (§3.9)
+├── receive.rs       # receiver-side engine + `LazyAssembler` (§3.9)
+└── tls.rs           # custom root store / insecure verifier for wss://
 ```
 
 ### 3.2 Dependencies (rationale)
@@ -314,6 +319,141 @@ on) is on the v0.3 backlog so distro maintainers can ship a separate
 On transport exit it sleeps the backoff (`PROTOCOL.md` §2.5) and retries. The
 clipboard task keeps running across reconnects; outbound frames are dropped
 while disconnected (clipboard is last-write-wins, no queueing needed).
+
+The supervisor also owns the state that must outlive a single connection: the
+offer registry, the pull server, and the receive engine. A reconnect creates a
+new socket but not a new engine, because a transfer's sessions are keyed by
+`transfer_id` and by definition span multiple frames.
+
+### 3.8 Device identity
+
+A peer has two ids and they are not interchangeable (wire spec §2.1):
+
+- `client_id` — minted by the hub per connection. Dies with the socket.
+- `device_id` — minted by the client, stable for the machine's lifetime.
+
+Only the second can be addressed. `peer_changed`, `file_offer.from_device`,
+`file_pull.from_device` and `file_abort.to` all carry device ids, because a
+frame that named a connection would become undeliverable the moment that
+connection dropped.
+
+**`device_id` lives in the state directory, not in `config.toml`.** The settings
+dialog rewrites the config file wholesale on Save; anything stored there and not
+modelled by the form would be erased by a user editing the poll interval. The
+state dir (`identity::load_or_create`) is never rewritten from the UI, so the id
+survives. A failure to load it is **not** fatal — an unwritable state dir costs
+a stable id, not the connection — and the fallback is an ephemeral `Uuid::new_v4()`
+logged at WARN, which looks exactly like a first run.
+
+Because the id is persisted in a file, copying a machine image clones it. Two
+hosts then present the same `device_id`, and the hub's duplicate-session rule
+(`4005`) makes them evict each other in a loop. The state file therefore records
+a host fingerprint alongside the id; a mismatch is treated as "new machine" and
+a fresh id is minted. This is detection, not prevention: it cannot tell a cloned
+image from a legitimately moved disk, and it deliberately errs toward a new id,
+since a spurious identity change costs an offer refresh while a duplicate id
+costs the connection.
+
+**`from_device` is written only by the hub.** Every control frame that carries it
+arrives from a client with that field either absent or a lie. The hub overwrites
+it from its own registry on relay (`ws.rs` clears it on the way in; the hub sets
+it on the way out). A source that trusted a client-supplied value would let any
+peer redirect a file's bytes to a device of its choosing.
+
+### 3.9 Offer registry and pull server
+
+The lazy path splits into three pieces with one job each:
+
+| Piece | Question it answers | State |
+| ----- | ------------------- | ----- |
+| `offer::OfferRegistry` (source) | *Which files am I willing to serve, and from which path?* | `file_id → (path, pinned identity)`, plus a reverse index by path |
+| `pull::PullServer` (source) | *What does this pull get?* | `transfer_id → session` (hasher, high-water mark, admission) |
+| `receive::ReceiveEngine` (receiver) | *Do I accept this chunk, and am I done?* | `transfer_id → session` (bitmap, contiguous run, in-flight window) |
+
+**Offers are keyed by `(owner device, file_id)`, not by `file_id`.** `file_id` is
+chosen by the client, so a bare key would let one peer overwrite another peer's
+offer simply by reusing its id. The pair is the identity of an offer.
+
+**Identity is re-checked repeatedly, not once.** A `PinnedIdentity` is captured
+when the offer is built — `file_key` (`(dev, ino)` on Unix, `(volume, index)` on
+Windows, `None` where the platform cannot supply one), `size`, and `mtime_ns` —
+and compared again:
+
+- before every window is read — a file rewritten mid-transfer would otherwise
+  splice two versions into one hash stream;
+- before the digest is emitted — the last chance to notice the file changed
+  between the final chunk and the hash.
+
+A mismatch answers `file_abort{source_changed}`. There is no resume: the
+receiver restarts from index 0 under a new `transfer_id`, because a single
+digest can only vouch for the whole file and a partial restart would have no
+value to verify against.
+
+**Sessions start at index 0 and restart from there.** A `transfer_id` the source
+has not seen must arrive with `chunk_index == 0`; anything else is
+`invalid_start` before any disk I/O happens. That rule is what makes "the
+receiver restarts from zero" a safe recovery rather than a guess.
+
+The pull server retains a completed session past its digest, up to an idle
+timeout. That is not an optimisation: a `file_digest` can be dropped by a full
+peer buffer, and the receiver's recovery is to re-ask for the final window. A
+source that forgot the session the instant it answered would turn every dropped
+digest into a full re-download.
+
+### 3.10 Hub delivery, and why there are two queues
+
+The hub is a single synchronous actor. It must never `await` a peer, because
+one slow receiver would then stall every other client's traffic — the exact
+failure the backpressure requirement exists to prevent.
+
+Each connection therefore has **two** outbound paths for bulk data:
+
+| Queue | Capacity | Purpose |
+| ----- | -------- | ------- |
+| `file` (`PER_CLIENT_FILE_CHANNEL_BUF`) | 4 chunks | The primary path, drained by the peer's writer |
+| `overflow` (`PER_CLIENT_FILE_OVERFLOW`) | 8 chunks | Second chance when the primary is full |
+
+`try_send` on the primary, then `try_send` on the overflow. If both are full the
+hub **aborts that one transfer** with `file_abort{busy}` rather than dropping a
+chunk silently: a missing chunk inside a session is unrecoverable without a
+restart anyway, so the honest answer is the one that lets the receiver restart
+immediately. Eager chunks have no session to abort, so they are dropped with a
+warning — there is nothing to name.
+
+Control frames take a third, separate lane (`frames`, capacity 8). Keeping them
+apart means a close instruction, a digest, or a busy abort can still get through
+while the data path is saturated.
+
+Two limits are easy to confuse and bound different things:
+
+| Limit | Bounds | Effect when hit |
+| ----- | ------ | --------------- |
+| `MAX_ACTIVE_PULLS` (4) | How many transfers one **source** reads at once | Further sessions queue behind batch-mates or get `busy`; bounds open file handles and 4 MiB read buffers per source |
+| `MAX_ACTIVE_TRANSFERS` (16 384) | How many session ids the **hub** remembers | The hub forgets the oldest batch so it can keep applying TTL per transfer; nothing is refused |
+
+`MAX_ACTIVE_TRANSFERS` is a memory bound, not a concurrency limit. It exists
+because the hub must answer "has this transfer started?" for a pull that arrives
+after the offer's TTL — and the set of answers grows once per accepted pull.
+
+### 3.11 Why the digest covers the served stream, not the file
+
+`file_digest` (and an eager chunk's `file_sha256`) is the hash of the bytes the
+source actually read out of the file, accumulated as they were sent. It is
+**not** a re-hash of the file on disk at completion time.
+
+That distinction matters because it makes one class of corruption invisible: if
+the file is rewritten while it is being served, the hasher sees a mixture of old
+and new bytes, the receiver receives exactly that mixture, and the digest
+matches. Verification passes on a file neither side would have chosen.
+
+The protocol does not try to prevent that with the digest — it cannot, since the
+digest is computed from the same stream. It prevents it with the identity
+re-checks described in §3.9: each window re-stats the file, so a change between
+windows is caught by something other than the hash. What remains is the gap
+*between* a stat and the reads that follow it, and that is bounded by one window
+rather than by the whole file.
+
+<!-- Phase 6/7: paste paths, pending spikes 0.1/0.2 -->
 
 ## 4. The `clipboardwire` binary (`cli/`)
 

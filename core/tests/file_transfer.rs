@@ -451,3 +451,88 @@ async fn dropping_the_transport_flushes_queued_chunks_whichever_arm_wins() {
     let _ = fs::remove_dir_all(&send_dir);
     let _ = fs::remove_dir_all(&save_dir);
 }
+
+// ---- Phase 8.9: the v0.3 fixture must survive the production path ----------
+
+/// `protocol.rs` pins the v0.3 eager wire shape with `V03_EAGER_CHUNK_JSON`, but
+/// that fixture is built from a hand-written struct — it proves the *type*
+/// serialises correctly, not that `send_file_through` produces that type.
+///
+/// `phase2_fixture_gap`: a field added to `FileChunkFrame` and populated by
+/// `send_file_through` (or a reordering of the struct) would pass the
+/// protocol test and still break v0.3 readers on the wire. This test drives the
+/// real sender and inspects the bytes it actually emits.
+///
+/// Not byte-for-byte against the whole fixture, and the reason is documented
+/// rather than worked around: `send_file_through` mints a fresh `Uuid::new_v4()`
+/// per call (deliberately — see `send_file_with_progress`), so `file_id` cannot
+/// be fixed without changing production code. Everything else is compared
+/// literally, **including field order**, because the assertion is on the
+/// serialised substring list rather than on a struct.
+#[tokio::test]
+async fn send_file_through_produces_the_v03_fixture_bytes() {
+    use clipboardwire_core::protocol::Frame;
+
+    let dir = unique_tmp_dir("fixture-prod");
+    let path = dir.join("fixture.txt");
+    // The fixture's payload is base64 "aGk=" = b"hi", file_size 3 in the
+    // original fixture is "aGk=" decoded... the fixture is a shape test, so the
+    // bytes only have to be reproducible here, not identical to it.
+    fs::write(&path, b"hi").unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    send_file_through(&path, &tx)
+        .await
+        .expect("send_file_through");
+    let chunk = rx
+        .try_recv()
+        .expect("the sender must emit at least one chunk");
+
+    // Every new-in-0.4 field must be absent, or a v0.3 reader sees a lazy chunk.
+    assert_eq!(chunk.transfer_id, None, "eager chunks carry no session");
+    assert_eq!(chunk.to, None, "eager chunks are broadcast, never directed");
+    assert_eq!(
+        chunk.from_device, None,
+        "only the hub stamps `from_device`, and only on relay"
+    );
+    assert!(
+        chunk.file_sha256.is_some(),
+        "eager chunks carry the whole-file hash; a lazy one would not"
+    );
+
+    let json = serde_json::to_string(&Frame::FileChunk(chunk.clone())).unwrap();
+
+    // Field order is part of the contract: v0.3 readers tolerate extra
+    // trailing fields but the shipped v0.3 writer produced this exact order,
+    // and `eager_chunk_serialises_byte_identically_to_v03` pins the type
+    // against it. Re-assert it here on a production-produced value.
+    let keys = [
+        r#""type":"file_chunk""#,
+        r#""file_id":""#,
+        r#""name":"fixture.txt""#,
+        r#""content_type":"text/plain; charset=utf-8""#,
+        r#""chunk_index":0"#,
+        r#""total_chunks":1"#,
+        r#""file_sha256":"#,
+        r#""file_size":2"#,
+        r#""payload_b64":"aGk=""#,
+    ];
+    let mut cursor = 0usize;
+    for key in keys {
+        let found = json[cursor..]
+            .find(key)
+            .unwrap_or_else(|| panic!("expected {key:?} after byte {cursor} in {json}"));
+        cursor += found + key.len();
+    }
+    assert!(json.ends_with('}'), "the frame must close cleanly: {json}");
+
+    // Nothing from a later revision leaked in.
+    for forbidden in ["\"transfer_id\"", "\"to\"", "\"from_device\""] {
+        assert!(
+            !json.contains(forbidden),
+            "an eager chunk must not serialise {forbidden}: {json}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
