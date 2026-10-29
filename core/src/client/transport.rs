@@ -90,6 +90,17 @@ pub struct Transport {
     pub inbound_control_rx: Option<mpsc::Receiver<Frame>>,
     /// Outbound control frames: offers, pulls, digests, aborts.
     pub outbound_control_tx: mpsc::Sender<Frame>,
+    /// Capabilities the hub advertised in its most recent `welcome`.
+    ///
+    /// Empty for a pre-0.4 hub, and empty until the first welcome arrives.
+    ///
+    /// A `watch` rather than a plain field because **a reconnect can change
+    /// it** — a hub restart or a switch to a different server may advertise a
+    /// different set — while [`Transport`] itself is created once and the
+    /// supervisor's loop runs across every reconnect. The supervisor reads this
+    /// per copy rather than caching it, so it always gates on the connection
+    /// that is actually live.
+    pub hub_caps: watch::Receiver<Caps>,
 }
 
 /// Configuration for [`spawn_with_options`]. Optional flags layered on
@@ -163,6 +174,10 @@ pub fn spawn_with_options(
         (None, None)
     };
     let (outbound_control_tx, outbound_control_rx) = mpsc::channel::<Frame>(OUTBOUND_CONTROL_BUF);
+    // Starts empty, which is the correct answer while no welcome has arrived:
+    // a sender that copies a file before the handshake completes must not
+    // assume the hub understands offers.
+    let (hub_caps_tx, hub_caps_rx) = watch::channel(Caps::default());
     let SpawnOptions {
         status_tx,
         one_shot,
@@ -184,6 +199,7 @@ pub fn spawn_with_options(
             WireOptions { device, caps },
             links,
             status_tx,
+            hub_caps_tx,
             one_shot,
         )
         .await;
@@ -196,6 +212,7 @@ pub fn spawn_with_options(
             outbound_files_tx,
             inbound_control_rx,
             outbound_control_tx,
+            hub_caps: hub_caps_rx,
         },
         join,
     )
@@ -230,6 +247,7 @@ async fn run_loop(
     wire: WireOptions,
     mut links: Links,
     status_tx: Option<watch::Sender<ClientStatus>>,
+    hub_caps_tx: watch::Sender<Caps>,
     one_shot: bool,
 ) {
     let emit = |s: ClientStatus| {
@@ -243,7 +261,8 @@ async fn run_loop(
     loop {
         emit(ClientStatus::Connecting);
         let attempt_start = Instant::now();
-        let outcome = connect_and_serve(&config, wire, &mut links, status_tx.as_ref()).await;
+        let outcome =
+            connect_and_serve(&config, wire, &mut links, status_tx.as_ref(), &hub_caps_tx).await;
         match &outcome {
             Ok(()) => debug!("connection ended cleanly"),
             Err(e) => warn!(error = %format!("{e:#}"), "connection error"),
@@ -412,6 +431,7 @@ async fn connect_and_serve(
     wire: WireOptions,
     links: &mut Links,
     status_tx: Option<&watch::Sender<ClientStatus>>,
+    hub_caps_tx: &watch::Sender<Caps>,
 ) -> Result<()> {
     let url = upgrade_url(&config.server, wire.device, wire.caps);
     let mut req = url
@@ -453,6 +473,11 @@ async fn connect_and_serve(
     // capabilities", which is exactly what makes a mixed deployment fall back
     // to eager.
     let hub_caps = Caps::parse_guarded(&welcome.caps.join(","));
+    // Hand the supervisor what this hub can do, so a lazy send is gated on the
+    // hub actually understanding offers. Published per connection: a reconnect
+    // may reach a hub that advertises something else, and the supervisor must
+    // gate on the live one.
+    let _ = hub_caps_tx.send(hub_caps);
     debug!(
         server = %welcome.server,
         client_id = %welcome.client_id,

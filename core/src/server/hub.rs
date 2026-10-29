@@ -254,9 +254,10 @@ pub enum ControlMsg {
 struct PeerEntry {
     /// Identity the peer advertised, or the per-connection id minted for it.
     device: Uuid,
-    /// Capabilities from the upgrade query. Read by capability filtering
-    /// (3.4b/3.5); recorded from 3.4a.
-    #[allow(dead_code)]
+    /// Capabilities from the upgrade query.
+    ///
+    /// Read by [`Hub::broadcast_offer`], which must not send `file_offer` to a
+    /// peer that did not claim `lazy-file`.
     caps: Caps,
     clip: mpsc::Sender<ClipFrame>,
     file: mpsc::Sender<FileChunkFrame>,
@@ -882,8 +883,28 @@ impl Hub {
                 reply,
             } => match self.register_offer(from, &mut offer) {
                 Ok(device) => {
+                    // Clone before the insert moves `offer` into the map: the
+                    // broadcast frame must survive that move, and cloning
+                    // afterwards would have to reach back into the map for it.
+                    let file_id = offer.file_id;
+                    let broadcast = Frame::FileOffer(offer.clone());
                     self.offers
-                        .insert((device, offer.file_id), StoredOffer { frame: offer });
+                        .insert((device, file_id), StoredOffer { frame: offer });
+
+                    // Tell the peers that are already connected. Without this an
+                    // offer only reaches a client through `welcome.offers`, i.e.
+                    // at connect time, so a peer that was already online when the
+                    // copy happened would never learn of it — and lazy transfer
+                    // would fail in exactly the common case of two clients that
+                    // are both running. `design.md` §4.1 says "insert,
+                    // broadcast"; only the insert existed.
+                    let delivered = self.broadcast_offer(from, broadcast);
+                    debug!(
+                        %device,
+                        %file_id,
+                        delivered,
+                        "offered a file to connected peers"
+                    );
                     let _ = reply.send(OfferResult::Accepted);
                 }
                 Err(verdict) => {
@@ -1005,6 +1026,53 @@ impl Hub {
                 self.sweep_active_transfers();
             }
         }
+    }
+
+    /// Fan a newly registered offer out to the peers that can act on it.
+    ///
+    /// **Filtered by recipient capability.** The spec's capability requirement is
+    /// explicit: a sender "SHALL publish offers only when the hub advertises
+    /// `lazy-file`, and SHALL NOT send them to peers that do not". The sender
+    /// cannot honour the second half — it only knows what `peer_changed` told it,
+    /// and that arrives asynchronously — so the hub does it here, where every
+    /// peer's `caps` is already recorded from its upgrade query.
+    ///
+    /// A pre-0.4 client advertises nothing, so `Caps::default()` fails the check
+    /// and it receives no offers. That is the intended outcome: it has no
+    /// `file_offer` handling, and sending it one would only make an old build log
+    /// a frame it cannot use.
+    ///
+    /// The sender is skipped: it knows what it just offered, and echoing it back
+    /// would make every copy look like a remote event to its own client.
+    ///
+    /// A full routed-frame buffer drops the offer for that peer **without**
+    /// affecting the offer itself: it is already in [`Self::offers`], so the peer
+    /// can still pull it — and will see it in `welcome.offers` on reconnect.
+    fn broadcast_offer(&self, from: Uuid, frame: Frame) -> usize {
+        let mut delivered = 0usize;
+        for (peer_id, peer) in self.clients.iter() {
+            if *peer_id == from {
+                continue;
+            }
+            if !peer.caps.contains(Caps::LAZY_FILE) {
+                debug!(
+                    client = %peer_id,
+                    "peer does not advertise lazy-file; not sending the offer"
+                );
+                continue;
+            }
+            match peer.frames.try_send(frame.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        client = %peer_id,
+                        "routed-frame buffer full; dropping file_offer"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+        delivered
     }
 
     /// Fan an offer-scoped abort out to every peer but `from`.
@@ -3007,6 +3075,32 @@ mod tests {
         frames
     }
 
+    /// Register a peer with an explicit capability set, returning its routed
+    /// frames receiver.
+    fn register_with_caps(
+        hub: &mut Hub,
+        id: Uuid,
+        device: Uuid,
+        caps: Caps,
+    ) -> mpsc::Receiver<Frame> {
+        let (file_tx, file_rx) = mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF);
+        let (frames_tx, frames_rx) = mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF);
+        let (ack, _ack_rx) = oneshot::channel();
+        hub.handle(HubMessage::Register {
+            id,
+            device,
+            caps,
+            outbound: mpsc::channel(PER_CLIENT_CHANNEL_BUF).0,
+            file_outbound: file_tx,
+            overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
+            frames: frames_tx,
+            ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
+            ack,
+        });
+        keep_alive(file_rx);
+        frames_rx
+    }
+
     #[test]
     fn welcome_lists_live_offers_and_peers() {
         let (mut hub, a_client, a_device) = hub_at(1_000);
@@ -3365,6 +3459,214 @@ mod tests {
             source_frames.try_recv().is_err(),
             "a refused pull must not reach the source"
         );
+    }
+
+    // ---- Offer fan-out (design §4.1: "insert, broadcast") ----
+
+    /// The next `file_offer` on `rx`, skipping membership notices.
+    fn next_offer(rx: &mut mpsc::Receiver<Frame>) -> Option<FileOfferFrame> {
+        loop {
+            match rx.try_recv() {
+                Ok(Frame::FileOffer(offer)) => return Some(offer),
+                Ok(Frame::PeerChanged(_)) => continue,
+                Ok(other) => panic!("expected file_offer, got {other:?}"),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[test]
+    fn an_offer_reaches_peers_that_are_already_connected() {
+        // The regression: `PublishOffer` used to insert and ACK without telling
+        // anyone. An offer then reached a client only through `welcome.offers`,
+        // i.e. at connect time, so a peer that was already online never learned
+        // of it — and lazy transfer failed in exactly the common case of two
+        // clients running at once.
+        let (mut hub, source_client, _source_device) = hub_at(1_000);
+        let receiver_client = Uuid::new_v4();
+        let receiver_device = Uuid::new_v4();
+        let mut receiver_frames =
+            register_with_caps(&mut hub, receiver_client, receiver_device, Caps::LAZY_FILE);
+        // Registering broadcasts a join notice, which this test does not care
+        // about; draining it keeps the next assertion about the offer alone.
+        while receiver_frames.try_recv().is_ok() {}
+
+        let file_id = Uuid::new_v4();
+        let mut offer = offer_at(file_id, 1_000 + MINUTE_MS);
+        offer.name = "quarterly.pdf".to_string();
+        assert_eq!(
+            publish_offer(&mut hub, source_client, offer),
+            OfferResult::Accepted
+        );
+
+        let received = next_offer(&mut receiver_frames)
+            .expect("an already-connected lazy peer must be told about the offer");
+        assert_eq!(received.file_id, file_id);
+        assert_eq!(received.name, "quarterly.pdf");
+        assert_eq!(
+            received.from_device,
+            Some(hub.clients[&source_client].device),
+            "the hub stamps the offering device, and the recipient needs it to pull"
+        );
+    }
+
+    #[test]
+    fn the_sender_does_not_receive_its_own_offer() {
+        // Echoing the offer back would make every copy look like a remote event
+        // to the client that just made it — and a client that pulls on `offer`
+        // would race itself for its own file.
+        let mut hub = hub_direct();
+        hub.now_override = Some(1_000);
+        let source_client = Uuid::new_v4();
+        let source_device = Uuid::new_v4();
+        let mut source_frames =
+            register_with_caps(&mut hub, source_client, source_device, Caps::LAZY_FILE);
+
+        assert_eq!(
+            publish_offer(
+                &mut hub,
+                source_client,
+                offer_at(Uuid::new_v4(), 1_000 + MINUTE_MS)
+            ),
+            OfferResult::Accepted
+        );
+
+        assert!(
+            next_offer(&mut source_frames).is_none(),
+            "the sender must not be sent its own offer"
+        );
+    }
+
+    #[test]
+    fn an_offer_is_not_sent_to_a_peer_without_lazy_file() {
+        // Spec: a sender "SHALL NOT send them to peers that do not" advertise
+        // `lazy-file`. The sender cannot enforce that (it sees peers only
+        // through asynchronous `peer_changed`), so the hub filters here. A
+        // pre-0.4 client advertises nothing and therefore receives nothing —
+        // which is correct, since it has no `file_offer` handling.
+        let (mut hub, source_client, _source_device) = hub_at(1_000);
+        let legacy_client = Uuid::new_v4();
+        let mut legacy_frames =
+            register_with_caps(&mut hub, legacy_client, Uuid::new_v4(), Caps::default());
+        while legacy_frames.try_recv().is_ok() {}
+
+        assert_eq!(
+            publish_offer(
+                &mut hub,
+                source_client,
+                offer_at(Uuid::new_v4(), 1_000 + MINUTE_MS)
+            ),
+            OfferResult::Accepted
+        );
+
+        assert!(
+            next_offer(&mut legacy_frames).is_none(),
+            "a peer that never advertised lazy-file must not receive offers"
+        );
+    }
+
+    #[test]
+    fn an_offer_survives_a_full_routed_frame_buffer() {
+        // A dropped broadcast must not cost the offer: it is already in the
+        // registry, so the peer can still pull it, and it appears in
+        // `welcome.offers` on reconnect. `try_send` failing is a notification
+        // loss, not an offer loss.
+        let mut hub = hub_direct();
+        hub.now_override = Some(1_000);
+        // The source's own receiver must stay alive: a dropped routed-frame
+        // channel makes `deliver_frame_to_device` answer `UnknownDevice`, and
+        // the pull would then fail for a reason unrelated to this test.
+        let source_client = Uuid::new_v4();
+        let source_device = Uuid::new_v4();
+        let source_frames =
+            register_with_caps(&mut hub, source_client, source_device, Caps::LAZY_FILE);
+
+        let busy_client = Uuid::new_v4();
+        let busy_device = Uuid::new_v4();
+        let busy_frames = register_with_caps(&mut hub, busy_client, busy_device, Caps::LAZY_FILE);
+
+        let file_id = Uuid::new_v4();
+        // Fill the channel: `PER_CLIENT_FRAME_CHANNEL_BUF` offers, each a
+        // separate file so none overwrites another.
+        for _ in 0..PER_CLIENT_FRAME_CHANNEL_BUF {
+            assert_eq!(
+                publish_offer(
+                    &mut hub,
+                    source_client,
+                    offer_at(Uuid::new_v4(), 1_000 + MINUTE_MS)
+                ),
+                OfferResult::Accepted
+            );
+        }
+        // Now the buffer is full; this one cannot be delivered.
+        assert_eq!(
+            publish_offer(
+                &mut hub,
+                source_client,
+                offer_at(file_id, 1_000 + MINUTE_MS)
+            ),
+            OfferResult::Accepted,
+            "a full peer buffer must not fail the publish"
+        );
+
+        assert!(
+            hub.offers.contains_key(&(source_device, file_id)),
+            "the offer must be registered even though its broadcast was dropped"
+        );
+        // And it is still authoritative for a pull.
+        assert_eq!(
+            authorize(&mut hub, busy_client, pull_of(file_id, source_device)),
+            PullResult::Forward { source_client },
+            "an offer whose broadcast was dropped is still pullable"
+        );
+        keep_alive(source_frames);
+        keep_alive(busy_frames);
+    }
+
+    #[test]
+    fn an_offer_published_through_the_hub_reaches_a_connected_receiver() {
+        // The integration-shaped version of (a): driven through `Hub`'s public
+        // `publish_offer`/`register` surface rather than by calling internals, so
+        // it covers the same path a websocket client does.
+        //
+        // `core/tests/lazy_transfer.rs` deliberately wires `PullServer` straight
+        // to `ReceiveEngine`, which is what made it deterministic — and also what
+        // let this defect through, because no hub was on the path.
+        let mut hub = hub_at(1_000).0;
+        let source_device = Uuid::new_v4();
+        let source_client = Uuid::new_v4();
+        let (ack, _ack_rx) = oneshot::channel();
+        hub.handle(HubMessage::Register {
+            id: source_client,
+            device: source_device,
+            caps: Caps::LAZY_FILE,
+            outbound: mpsc::channel(PER_CLIENT_CHANNEL_BUF).0,
+            file_outbound: mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF).0,
+            overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
+            frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+            ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
+            ack,
+        });
+
+        let receiver_device = Uuid::new_v4();
+        let receiver_client = Uuid::new_v4();
+        let mut receiver_frames =
+            register_with_caps(&mut hub, receiver_client, receiver_device, Caps::LAZY_FILE);
+        while receiver_frames.try_recv().is_ok() {}
+
+        let file_id = Uuid::new_v4();
+        assert_eq!(
+            publish_offer(
+                &mut hub,
+                source_client,
+                offer_at(file_id, 1_000 + MINUTE_MS)
+            ),
+            OfferResult::Accepted
+        );
+
+        let offer = next_offer(&mut receiver_frames).expect("receiver must be notified");
+        assert_eq!(offer.file_id, file_id);
+        assert_eq!(offer.from_device, Some(source_device));
     }
 
     // ---- TTL gates the start of a transfer, not its continuation ----

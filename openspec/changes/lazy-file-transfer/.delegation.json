@@ -1,41 +1,47 @@
 {
-  "phase": "active-transfers-cap",
-  "pending_operation": "cw-build-active-transfers-cap",
+  "phase": "hub-caps-gate",
+  "pending_operation": "cw-build-hub-caps-gate",
   "builder_session": "b02422f4-9ad4-4ba3-aeb4-bc480a3c6d5f",
   "reviewer_session": "108fb788-f6b8-44f7-bf12-d892d73b4577",
   "process_correction": "All code changes go through Builder. Lead only reads, runs gates, greps, and edits openspec/ + AGENTS.md.",
 
-  "progress": {
-    "phase1": "COMPLETE", "phase2": "COMPLETE", "phase3": "COMPLETE", "phase4": "COMPLETE", "phase5": "COMPLETE",
-    "phase6_7": "BLOCKED on the user's real-GUI spikes 0.1 (macOS) and 0.2 (Windows)",
-    "phase8": "NOT STARTED -- does not depend on the spikes, but flipping the defaults before paste is proven would ship an unusable default"
-  },
-  "gates": "429 passed / 0 failed / 5 ignored, 8 consecutive runs (measured after the builder finished editing); fmt clean; clippy clean; NOTHING COMMITTED",
+  "committed": {"sha": "cdc50f0", "message": "feat: lazy file transfer protocol v0.4 (Phases 1-5)"},
 
-  "hub_ttl_fix_verified": {
-    "delivered": "active_transfers keyed by transfer_id; continued transfers are exempt from the offer TTL; six tests",
-    "gates": "429 passed x8, all identical",
-    "the_builder_found_a_second_sweep_path": "I told it not to delete an offer a live transfer needs. It found that sweep_expired_offers also runs on every peer registration, so a peer joining mid-file would have destroyed an in-progress transfer through a path my instruction did not mention. It added that test and the offer-keybook in ActiveTransfer. Mutation 3 fails ONLY that test, which is exactly why it was worth adding.",
-    "mutation_design_note": "mutations 1 and 2 are equivalent (both disable the continued-check) and fail the same two tests; mutation 3 targets a different code path entirely. The builder ran all three rather than stopping at the two I asked for."
+  "offer_fanout_verified": {
+    "delivered": "broadcast_offer fanning out to already-connected peers, filtered on the recipient's lazy-file capability, sender skipped; 5 tests",
+    "gates": "438 passed x8 (I ran the loop)",
+    "capability_filter_confirmed": "hub.rs:1057 skips a peer whose caps lack LAZY_FILE, which also excludes every pre-0.4 client for free since their capability set is empty",
+    "builders_borrow_correction": "my snippet moved `offer` into the map and then tried to clone from it; it restructured to copy file_id, clone the frame, then move -- my version would not have compiled",
+    "known_gap_it_flagged": "a full routed-frame buffer drops the offer notification for that peer with only a warn. The offer itself stays in the map and remains pullable, and it reappears in welcome.offers on reconnect -- the same trade-off broadcast_abort already makes. Not addressed; adding retry needs per-peer offer versioning."
   },
 
-  "defect_i_found_in_my_own_fix": {
-    "what": "active_transfers has no size bound",
-    "how": "the builder's closing note mentioned exempted offers counting toward caps; following that thread led to the map itself",
-    "attack": "one live offer plus unlimited distinct transfer_ids: every pull is authorised, every Delivered insert lands, and each entry lives TRANSFER_MEMORY_MS (30 min). Note Delivered only means the frame reached the source's channel -- it does not mean the source accepted the session, so a source answering busy still leaves an entry behind.",
-    "scale": "roughly 80 bytes per entry including table overhead; ~550 pulls/second sustains ~80 MB. MAX_OFFERS_TOTAL bounds offers but nothing bounded transfers.",
-    "fix_dispatched": "cap at 4 * MAX_OFFERS_TOTAL, evicted in BATCHES rather than one at a time -- single-entry eviction at the cap would rescan 16k entries on every subsequent pull, converting a memory bound into a CPU one",
-    "fails_closed": "a forgotten transfer simply returns to the TTL gate, which is the pre-existing behaviour"
+  "second_unimplemented_requirement_found": {
+    "spec_text": "A sender SHALL publish offers only when the hub advertises `lazy-file`",
+    "reality": "transport.rs parses hub_caps at line 455 but uses it only for a debug line and a consistency warning; it is never handed to the supervisor, and publish_offers looks only at SendMode",
+    "consequence": "a v0.4 client with send_mode=lazy against a v0.3 hub publishes offers into the void. The v0.3 hub ignores unknown frame types by design, so nothing errors -- the copy looks successful and no peer can ever pull it. Silent failure.",
+    "fix_dispatched": "hub_caps becomes a watch::Receiver on Transport so reconnects are visible; SendPolicy::may_publish_offers requires both the local mode and the hub capability; when lazy is configured but the hub cannot act on it, fall back to eager with a single warning per connection rather than failing the copy",
+    "judgement_called_out": "the spec does not say whether to degrade or fail. I chose degrade because the user's intent is to send the file and eager is the known-good v0.5.4 path; refusing would leave them unable to copy anything with no actionable fix. The builder may argue otherwise but must justify it."
   },
 
-  "process_note": "I ran a stress loop while the builder was still editing and got 423 / 428 / 429 across iterations, plus a transient fmt failure that was just a mid-edit snapshot. None of those intermediate readings meant anything. Do not verify a tree another actor is writing.",
-
-  "known_debt": {
-    "tls_field_name": "ClientConfig.tls_ca_file at HEAD",
-    "phase2_fixture_gap": "v0.3 byte-compat fixture never passes through send_file_through",
-    "paste_mode": "ReceiveMode::Paste is accepted on Windows/macOS by config but no platform path implements it (Phase 6/7)",
-    "pickup_ui": "engine-only; no tray menu item yet",
-    "git": "NOTHING COMMITTED. Phases 1-5 are a coherent unit."
+  "phase8_status": {
+    "8_2_to_8_5": "PROTOCOL.md rewritten, 223 -> 707 lines. Uncommitted; section 3.4 needs one paragraph updated now that fan-out exists -- the builder supplied the exact replacement text.",
+    "8_6": "ARCHITECTURE.md not started; the identity and overflow-queue sections do not need spikes",
+    "8_8": "partially covered by the new hub-level offer test; a full real-hub lazy transfer still missing",
+    "8_9": "eager regression via the 2.6 fixture not started",
+    "8_7": "CHANGELOG updated in Phase 4",
+    "8_1_8_10": "need spikes / an Android peer"
   },
-  "next_action": "on result: verify the cap holds under a synthetic flood and that eviction does not thrash, then report and ask about committing"
+
+  "remaining": {
+    "phase6_7": "BLOCKED on the user's spikes 0.1 (macOS NSFilePromiseProvider) and 0.2 (Windows IStream)",
+    "defaults_flip": "send_mode/receive_mode still eager; flipping before paste is proven would ship an unusable default on Windows/macOS",
+    "known_debt": [
+      "ReceiveMode::Paste accepted by config, no platform path implements it",
+      "pickup has an engine but no tray menu item",
+      "ClientConfig.tls_ca_file looks redaction-mangled, renaming breaks configs",
+      "phase2 fixture never passes through send_file_through",
+      "build/ and dist/ untracked and unignored"
+    ]
+  },
+  "next_action": "on result: verify the fallback actually emits chunks rather than nothing, then update PROTOCOL.md 3.4 and commit docs + fan-out + this gate together"
 }

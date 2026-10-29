@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
-    is_text_content_type, ClipFrame, FileAbortFrame, Frame, IMAGE_PNG_CONTENT_TYPE,
+    is_text_content_type, Caps, ClipFrame, FileAbortFrame, Frame, IMAGE_PNG_CONTENT_TYPE,
     TEXT_CONTENT_TYPE,
 };
 
@@ -334,6 +334,22 @@ impl SendPolicy {
             pull_idle_timeout_ms: i64::try_from(config.pull_idle_timeout_secs).unwrap_or(i64::MAX)
                 * 1_000,
         }
+    }
+
+    /// Whether this copy may be published as an offer at all.
+    ///
+    /// Both halves matter: this client chose lazy sending, **and** the hub on
+    /// the other end must understand offers. Publishing to a hub that does not
+    /// advertise `lazy-file` would look successful to the user while no peer
+    /// could ever pull the file — the hub's reader ignores an unknown frame
+    /// type by design (§3 of the wire spec), so there is no error to surface
+    /// and nothing to retry. That is a silent failure, which is worse than a
+    /// loud one.
+    ///
+    /// The spec states it as a requirement on the sender: "A sender SHALL
+    /// publish offers only when the hub advertises `lazy-file`".
+    pub fn may_publish_offers(&self, hub_caps: Caps) -> bool {
+        self.mode == SendMode::Lazy && hub_caps.contains(Caps::LAZY_FILE)
     }
 }
 
@@ -659,6 +675,13 @@ pub async fn run_supervisor_with_policy(
     // remembering what was advertised last time.
     let mut offers = offer::OfferRegistry::default();
 
+    // Whether the "hub cannot do lazy, falling back to eager" warning has been
+    // logged on the *current* connection. A user who copies ten files against a
+    // v0.3 hub should read why they are slow once, not ten times; resetting it
+    // when the verdict changes keeps a genuine reconnect from hiding a second,
+    // different downgrade.
+    let mut lazy_downgrade_warned = false;
+
     // One per process: sessions are keyed by `transfer_id` and are what the
     // running digest accumulates into, so they must outlive a single pull.
     let mut pulls = pull::PullServer::new(pull::MAX_ACTIVE_PULLS, send_policy.pull_idle_timeout_ms);
@@ -716,8 +739,15 @@ pub async fn run_supervisor_with_policy(
                         }
                     }
                     // Files: either advertise (lazy) or stream (eager).
-                    ClipChange::Files(paths) => match send_policy.mode {
-                        SendMode::Lazy => {
+                    //
+                    // `lazy` alone is not enough to publish: the hub has to
+                    // understand offers. Gating on the live `hub_caps` is what
+                    // turns "the user configured lazy against a v0.3 hub" from a
+                    // silent no-op into a working transfer.
+                    ClipChange::Files(paths) => {
+                        let hub_caps = *transport.hub_caps.borrow();
+                        if send_policy.may_publish_offers(hub_caps) {
+                            lazy_downgrade_warned = false;
                             let skipped = publish_offers(
                                 &mut offers,
                                 &paths,
@@ -731,8 +761,20 @@ pub async fn run_supervisor_with_policy(
                                     "skipping file in offer"
                                 );
                             }
-                        }
-                        SendMode::Eager => {
+                        } else {
+                            if send_policy.mode == SendMode::Lazy && !lazy_downgrade_warned {
+                                // Degrade, do not fail: the user asked for the
+                                // file to leave this machine, and eager is the
+                                // pre-lazy behaviour that still does that. The
+                                // warning is the only signal they get, so it
+                                // says what changed and why.
+                                warn!(
+                                    hub_caps = ?hub_caps.tokens(),
+                                    "hub does not advertise lazy-file; falling back to \
+                                     eager transfer for this and later copies"
+                                );
+                                lazy_downgrade_warned = true;
+                            }
                             for path in paths {
                                 if let Err(e) = file::send_file_with_progress(
                                     &path,
@@ -1475,6 +1517,10 @@ mod tests {
             mpsc::channel::<crate::protocol::FileChunkFrame>(8);
         let (outbound_control_tx, mut outbound_control_rx) = mpsc::channel::<Frame>(8);
         let (_inbound_tx, inbound_rx) = mpsc::channel::<ClipFrame>(8);
+        // The hub must advertise `lazy-file`, or the supervisor is right to
+        // refuse to publish an offer this hub could not serve (see
+        // `SendPolicy::may_publish_offers`).
+        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Caps::LAZY_FILE);
         let transport = Transport {
             inbound_rx,
             inbound_files_rx: None,
@@ -1482,6 +1528,7 @@ mod tests {
             outbound_files_tx,
             inbound_control_rx: None,
             outbound_control_tx,
+            hub_caps,
         };
 
         let supervisor = tokio::spawn(run_supervisor_with_policy(
@@ -1579,6 +1626,241 @@ mod tests {
         // nothing in the call path can reach it.
         drop(files_tx);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Transport` wired to channels the caller keeps, for supervisor tests.
+    #[allow(clippy::type_complexity)]
+    fn supervised_transport(
+        hub_caps: Caps,
+    ) -> (
+        Transport,
+        tokio::sync::mpsc::Receiver<Frame>,
+        tokio::sync::mpsc::Receiver<crate::protocol::FileChunkFrame>,
+        tokio::sync::watch::Sender<Caps>,
+    ) {
+        use tokio::sync::mpsc;
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<ClipFrame>(8);
+        let (outbound_files_tx, outbound_files_rx) =
+            mpsc::channel::<crate::protocol::FileChunkFrame>(8);
+        let (outbound_control_tx, outbound_control_rx) = mpsc::channel::<Frame>(8);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<ClipFrame>(8);
+        let (hub_caps_tx, hub_caps_rx) = tokio::sync::watch::channel(hub_caps);
+        // Leak both ends of the clip path. A dropped outbound receiver makes
+        // the supervisor's `try_send` fail; a dropped inbound *sender* closes
+        // `inbound_rx`, which the supervisor reads as "transport gone" and
+        // exits on. Neither channel is part of what these tests assert.
+        Box::leak(Box::new(_outbound_rx));
+        Box::leak(Box::new(inbound_tx));
+        (
+            Transport {
+                inbound_rx,
+                inbound_files_rx: None,
+                outbound_tx,
+                outbound_files_tx,
+                inbound_control_rx: None,
+                outbound_control_tx,
+                hub_caps: hub_caps_rx,
+            },
+            outbound_control_rx,
+            outbound_files_rx,
+            hub_caps_tx,
+        )
+    }
+
+    #[test]
+    fn lazy_sending_falls_back_to_eager_on_a_hub_without_lazy_file() {
+        // The silent failure this closes: `send_mode = "lazy"` against a v0.3
+        // hub used to publish `file_offer` frames that hub ignored, so the user
+        // saw "copied" and the file never moved. Eager is the pre-lazy
+        // behaviour and still delivers.
+        let policy = SendPolicy {
+            mode: SendMode::Lazy,
+            ..SendPolicy::default()
+        };
+        assert!(
+            !policy.may_publish_offers(Caps::default()),
+            "a hub with no capabilities cannot serve offers"
+        );
+        assert!(policy.may_publish_offers(Caps::LAZY_FILE));
+    }
+
+    #[tokio::test]
+    async fn lazy_sending_streams_eagerly_when_the_hub_lacks_lazy_file() {
+        // The behavioural half of the test above: it is not enough for the
+        // predicate to say "no", the supervisor has to actually take the eager
+        // path — chunks on the file channel, nothing on control.
+        let dir = unique_dir("lazy-downgrade");
+        let path = dir.join("fallback.bin");
+        std::fs::write(&path, vec![7u8; 1024]).unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+        let (apply_tx, _apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+        let (transport, mut control_rx, mut files_rx, _caps_tx) =
+            supervised_transport(Caps::default());
+
+        let supervisor = tokio::spawn(run_supervisor_with_policy(
+            Clipboard {
+                events_rx,
+                apply_tx,
+            },
+            transport,
+            None,
+            false,
+            None,
+            SendPolicy {
+                mode: SendMode::Lazy,
+                offer_ttl_ms: 60_000,
+                ..SendPolicy::default()
+            },
+            ReceivePolicy::default(),
+        ));
+
+        events_tx
+            .send(ClipChange::Files(vec![path.clone()]))
+            .await
+            .unwrap();
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), files_rx.recv())
+            .await
+            .expect("lazy mode against a non-lazy hub must fall back to eager chunks")
+            .expect("file channel open");
+        assert_eq!(chunk.name, "fallback.bin");
+        assert!(
+            chunk.file_sha256.is_some(),
+            "a fallback chunk is an EAGER chunk: it carries the whole-file hash"
+        );
+        assert!(chunk.transfer_id.is_none(), "an eager chunk has no session");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "no offer may be published to a hub that cannot serve it"
+        );
+
+        drop(events_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn eager_sending_never_publishes_offers_even_when_the_hub_could_serve_them() {
+        // The other direction: a capable hub must not turn an eager sender into
+        // a lazy one. `mode` is the operator's choice; `hub_caps` only ever
+        // *removes* a permission, never grants one.
+        let policy = SendPolicy {
+            mode: SendMode::Eager,
+            ..SendPolicy::default()
+        };
+        assert!(
+            !policy.may_publish_offers(Caps::LAZY_FILE),
+            "eager mode must not publish offers even to a capable hub"
+        );
+
+        let dir = unique_dir("eager-capable-hub");
+        let path = dir.join("eager.bin");
+        std::fs::write(&path, vec![3u8; 512]).unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+        let (apply_tx, _apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+        let (transport, mut control_rx, mut files_rx, _caps_tx) =
+            supervised_transport(Caps::LAZY_FILE);
+
+        let supervisor = tokio::spawn(run_supervisor_with_policy(
+            Clipboard {
+                events_rx,
+                apply_tx,
+            },
+            transport,
+            None,
+            false,
+            None,
+            SendPolicy {
+                mode: SendMode::Eager,
+                ..SendPolicy::default()
+            },
+            ReceivePolicy::default(),
+        ));
+
+        events_tx
+            .send(ClipChange::Files(vec![path.clone()]))
+            .await
+            .unwrap();
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), files_rx.recv())
+            .await
+            .expect("eager mode must stream chunks")
+            .expect("file channel open");
+        assert_eq!(chunk.name, "eager.bin");
+        assert!(control_rx.try_recv().is_err(), "no offer in eager mode");
+
+        drop(events_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_hub_caps_change_is_visible_to_the_supervisor() {
+        // `hub_caps` is a `watch` because a reconnect can reach a hub that
+        // advertises something else. If the supervisor cached the value at
+        // startup, the gate would keep using the old verdict for the life of
+        // the process — publishing offers to a hub that has since been swapped
+        // for one that cannot serve them.
+        let dir = unique_dir("caps-change");
+        let path = dir.join("later.bin");
+        std::fs::write(&path, vec![9u8; 256]).unwrap();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<ClipChange>(8);
+        let (apply_tx, _apply_rx) = std::sync::mpsc::channel::<ClipChange>();
+        // Start on a hub that cannot serve offers.
+        let (transport, mut control_rx, mut files_rx, caps_tx) =
+            supervised_transport(Caps::default());
+
+        let supervisor = tokio::spawn(run_supervisor_with_policy(
+            Clipboard {
+                events_rx,
+                apply_tx,
+            },
+            transport,
+            None,
+            false,
+            None,
+            SendPolicy {
+                mode: SendMode::Lazy,
+                offer_ttl_ms: 60_000,
+                ..SendPolicy::default()
+            },
+            ReceivePolicy::default(),
+        ));
+
+        // First copy: the empty caps force eager.
+        events_tx
+            .send(ClipChange::Files(vec![path.clone()]))
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), files_rx.recv())
+            .await
+            .expect("first copy falls back to eager")
+            .expect("file channel open");
+        assert_eq!(chunk.name, "later.bin");
+
+        // The hub is now known to support lazy. The very next copy must take
+        // the offer path, without a restart.
+        caps_tx.send(Caps::LAZY_FILE).unwrap();
+        events_tx
+            .send(ClipChange::Files(vec![path.clone()]))
+            .await
+            .unwrap();
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("the supervisor must pick up the new capabilities")
+            .expect("control channel open");
+        match frame {
+            Frame::FileOffer(offer) => assert_eq!(offer.name, "later.bin"),
+            other => panic!("expected file_offer after the caps change, got {other:?}"),
+        }
+
+        drop(events_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
