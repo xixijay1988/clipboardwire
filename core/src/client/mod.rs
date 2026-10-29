@@ -15,7 +15,7 @@ pub mod transport;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::{
@@ -643,8 +643,42 @@ pub async fn run_supervisor_with_policy(
     send_policy: SendPolicy,
     receive_policy: ReceivePolicy,
 ) {
-    let mut file_receiver = match save_dir {
-        Some(dir) => file::FileReceiver::with_save_dir(dir),
+    // **One** resolution of "where do received files go", shared by both receive
+    // paths. `None` from the caller means "the platform default", not "nowhere":
+    // `FileReceiver` already read it that way (via `FileReceiver::new`), while
+    // the lazy path tested `save_dir.is_some()` and therefore had no default at
+    // all — every pull that completed without an explicit directory was
+    // discarded with "digest arrived but no save dir is configured". Resolving
+    // here is what makes the two paths agree by construction instead of by
+    // coincidence.
+    //
+    // Precedence: `ReceivePolicy::save_dir`, then the `save_dir` argument, then
+    // the platform default. The first two are explicit overrides from a caller
+    // that knows better (the tray, a test); the third is what "not specified"
+    // has to mean. `None` stays in both signatures because that override
+    // capability is real, but neither may be treated as "nowhere to write".
+    let resolved_save_dir: Option<std::path::PathBuf> =
+        match receive_policy.save_dir.clone().or(save_dir) {
+            Some(dir) => Some(dir),
+            None => match file::default_save_dir() {
+                Ok(dir) => Some(dir),
+                Err(e) => {
+                    // Only reachable when the platform cannot report a home
+                    // directory at all. Both receive paths are unusable then, and
+                    // that is worth an ERROR rather than a warning: no file can ever
+                    // land, and the user's symptom is "nothing happens".
+                    error!(
+                        error = %format!("{e:#}"),
+                        "could not resolve a directory for received files; file transfer is \
+                         disabled for this process"
+                    );
+                    None
+                }
+            },
+        };
+
+    let mut file_receiver = match resolved_save_dir.as_ref() {
+        Some(dir) => file::FileReceiver::with_save_dir(dir.clone()),
         None => file::FileReceiver::new(),
     }
     .map_err(|e| {
@@ -701,10 +735,8 @@ pub async fn run_supervisor_with_policy(
     // and keeps the resolution well inside the slack either timer tolerates.
     let mut receive_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     receive_tick.tick().await; // skip the immediate first tick
-    let mut assembler = receive_policy
-        .save_dir
-        .clone()
-        .map(receive::LazyAssembler::new);
+                               // Same directory as the eager receiver above — see `resolved_save_dir`.
+    let mut assembler = resolved_save_dir.clone().map(receive::LazyAssembler::new);
 
     loop {
         // Snapshot for the async closure to avoid borrowing
@@ -1037,21 +1069,38 @@ pub async fn run_supervisor_with_policy(
                         match receives.handle_digest(&digest, now_millis()) {
                             receive::DigestOutcome::Ready { sha256 } => {
                                 let Some(assembler) = assembler.as_mut() else {
-                                    // No save dir means this process was built
-                                    // without one; nothing can be written, so
-                                    // the session has nowhere to go.
-                                    warn!("digest arrived but no save dir is configured");
+                                    // Unreachable in practice: `assembler` is
+                                    // built from `resolved_save_dir`, which is
+                                    // only `None` when the platform cannot
+                                    // report a home directory — and that case
+                                    // was already logged at ERROR before this
+                                    // loop started. Kept as a hard error rather
+                                    // than a warning because reaching it means
+                                    // a completed file is about to be thrown
+                                    // away, which is exactly the failure users
+                                    // report as "nothing happens".
+                                    error!(
+                                        %digest.transfer_id,
+                                        "digest arrived but no directory is configured for \
+                                         received files; discarding a completed transfer"
+                                    );
                                     receives.finish(&digest.transfer_id);
                                     continue;
                                 };
                                 let Some(session) = receives.session(&digest.transfer_id) else {
                                     continue;
                                 };
+                                // The same directory the partial file was
+                                // assembled under. This used to read
+                                // `receive_policy.save_dir`, which
+                                // `ReceivePolicy::from_config` always leaves
+                                // `None` — so every file that survived the
+                                // earlier bug landed in the temp directory
+                                // instead of the user's Downloads folder.
                                 let (file_id, name, save_dir) = (
                                     session.file_id,
                                     session.name.clone(),
-                                    receive_policy
-                                        .save_dir
+                                    resolved_save_dir
                                         .clone()
                                         .unwrap_or_else(std::env::temp_dir),
                                 );

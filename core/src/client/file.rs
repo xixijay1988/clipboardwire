@@ -582,7 +582,20 @@ fn chunk_len(index: u32, total_chunks: u32, file_size: u64) -> u64 {
     }
 }
 
-fn default_save_dir() -> Result<PathBuf> {
+/// Where received files land when the caller does not name a directory.
+///
+/// `~/Downloads/clipboardwire/` (or the platform equivalent), falling back to
+/// `<home>/Downloads/clipboardwire` when the platform cannot report a downloads
+/// directory. Created on first write, not here.
+///
+/// **Public because both receive paths must agree on it.** `FileReceiver` (eager
+/// chunks) and `LazyAssembler` (lazy pulls) are separate types with separate
+/// lifecycles, but "the user did not say where" has to mean one thing: when this
+/// was resolved only inside `FileReceiver::new`, the lazy path had no default at
+/// all and silently dropped every completed transfer. See
+/// `Client::resolved_save_dir` in `mod.rs` for the single place it is called
+/// in production.
+pub fn default_save_dir() -> Result<PathBuf> {
     let base = directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf()));
     let downloads = match base {
         Some(p) => p,

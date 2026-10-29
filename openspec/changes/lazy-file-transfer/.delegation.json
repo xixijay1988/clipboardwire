@@ -1,47 +1,77 @@
 {
-  "phase": "hub-caps-gate",
-  "pending_operation": "cw-build-hub-caps-gate",
+  "phase": "phase8-complete-and-test-builds",
   "builder_session": "b02422f4-9ad4-4ba3-aeb4-bc480a3c6d5f",
   "reviewer_session": "108fb788-f6b8-44f7-bf12-d892d73b4577",
+
   "process_correction": "All code changes go through Builder. Lead only reads, runs gates, greps, and edits openspec/ + AGENTS.md.",
 
-  "committed": {"sha": "cdc50f0", "message": "feat: lazy file transfer protocol v0.4 (Phases 1-5)"},
-
-  "offer_fanout_verified": {
-    "delivered": "broadcast_offer fanning out to already-connected peers, filtered on the recipient's lazy-file capability, sender skipped; 5 tests",
-    "gates": "438 passed x8 (I ran the loop)",
-    "capability_filter_confirmed": "hub.rs:1057 skips a peer whose caps lack LAZY_FILE, which also excludes every pre-0.4 client for free since their capability set is empty",
-    "builders_borrow_correction": "my snippet moved `offer` into the map and then tried to clone from it; it restructured to copy file_id, clone the frame, then move -- my version would not have compiled",
-    "known_gap_it_flagged": "a full routed-frame buffer drops the offer notification for that peer with only a warn. The offer itself stays in the map and remains pullable, and it reappears in welcome.offers on reconnect -- the same trade-off broadcast_abort already makes. Not addressed; adding retry needs per-peer offer versioning."
+  "lead_process_failure_this_stretch": {
+    "what_i_did": "After dispatching cw-fix-windows-build I polled with the wait tool and lody_operation_get for ~5 consecutive waits, including after the child had already finished at 03:29. The user interrupted with 'the child finished long ago, what are you waiting for'.",
+    "root_cause": "I treated `wait` as if it could observe an MCP operation. It cannot: an MCP operation is not a wake source, so wait runs its full timeout and tells me nothing. My own AGENTS.md says this explicitly ('Do not use the CLI wait tool to await an MCP operation').",
+    "correct_behaviour": "Dispatch, write this file, emit one status line, END THE TURN. The result arrives as a new inbound turn.",
+    "second_failure_same_stretch": "verify.sh tested for verify.bin while the receiver saves under the source file name (payload.bin). I shipped it without running it first; the first run reported 'nothing landed' while the log plainly showed 'received (done)'."
   },
 
-  "second_unimplemented_requirement_found": {
-    "spec_text": "A sender SHALL publish offers only when the hub advertises `lazy-file`",
-    "reality": "transport.rs parses hub_caps at line 455 but uses it only for a debug line and a consistency warning; it is never handed to the supervisor, and publish_offers looks only at SendMode",
-    "consequence": "a v0.4 client with send_mode=lazy against a v0.3 hub publishes offers into the void. The v0.3 hub ignores unknown frame types by design, so nothing errors -- the copy looks successful and no peer can ever pull it. Silent failure.",
-    "fix_dispatched": "hub_caps becomes a watch::Receiver on Transport so reconnects are visible; SendPolicy::may_publish_offers requires both the local mode and the hub capability; when lazy is configured but the hub cannot act on it, fall back to eager with a single warning per connection rather than failing the copy",
-    "judgement_called_out": "the spec does not say whether to degrade or fail. I chose degrade because the user's intent is to send the file and eager is the known-good v0.5.4 path; refusing would leave them unable to copy anything with no actionable fix. The builder may argue otherwise but must justify it."
+  "commits": [
+    {"sha": "cdc50f0", "message": "feat: lazy file transfer protocol v0.4 (Phases 1-5)"},
+    {"sha": "e31a405", "message": "fix: publish offers to connected peers, and gate lazy sending on hub caps"},
+    {"sha": "de197b7", "message": "test: lazy transfer through a real hub; document the new internals"},
+    {"sha": "8f41a58", "message": "fix: make one-shot `send` exit after delivering the file"},
+    {"sha": "260d097", "message": "docs: correct ARCHITECTURE.md claims that had gone stale"},
+    {"sha": "06e4426", "message": "fix: make the Windows target compile again"}
+  ],
+
+  "defects_found_this_stretch": {
+    "offer_fanout_missing": "PublishOffer did register->insert->ACK with no broadcast, so an offer reached a peer only via welcome.offers at connect time. Two already-connected clients could never transfer. Fixed e31a405.",
+    "hub_caps_not_gated": "welcome.caps was parsed but only logged, so a v0.4 sender against a v0.3 hub published offers nothing could pull. Fixed e31a405 (degrade to eager, one warning per connection).",
+    "send_never_exits": "`let _ = transport.outbound_tx;` discards the place, not the value, so the sender stayed alive and the one-shot task never returned. Present since ffa2f414 (2026-05-21); means drain_and_finish had never run in production. Fixed 8f41a58.",
+    "windows_target_does_not_compile": "offers.rs used MetadataExt::volume_serial_number/file_index, gated behind unstable windows_by_handle (issue 63010). The comment called them ordinary Option-returning methods; no released toolchain has them. Also i128::from(u128) which has never existed, and a #[cfg(unix)] inode_of called unconditionally from a test. Fixed 06e4426."
   },
 
-  "phase8_status": {
-    "8_2_to_8_5": "PROTOCOL.md rewritten, 223 -> 707 lines. Uncommitted; section 3.4 needs one paragraph updated now that fan-out exists -- the builder supplied the exact replacement text.",
-    "8_6": "ARCHITECTURE.md not started; the identity and overflow-queue sections do not need spikes",
-    "8_8": "partially covered by the new hub-level offer test; a full real-hub lazy transfer still missing",
-    "8_9": "eager regression via the 2.6 fixture not started",
-    "8_7": "CHANGELOG updated in Phase 4",
-    "8_1_8_10": "need spikes / an Android peer"
+  "verification_i_ran_myself": {
+    "gate_condition_mutation": "Reverted main.rs to `let _ =` and reproduced: 'send did not exit within 15s ... stderr: ... transport: connected'. Restored, 445/0/5 green.",
+    "windows_check": "cargo check --target x86_64-pc-windows-gnu -p clipboardwire: zero errors, zero warnings.",
+    "macos_gates": "fmt clean, clippy clean, 445 passed / 0 failed / 5 ignored.",
+    "end_to_end": "Real hub on loopback + lazy sender + pickup receiver, 12 MB: send rc=0 in 0s, SHA256 matched.",
+    "verify_script": "dist-test/verify.sh self-tested to PASS before shipping (after fixing the filename bug above)."
+  },
+
+  "test_builds_delivered": {
+    "macos_app_tar": "clipboardwire-0.5.4-lazy-macos-aarch64.app.tar.gz",
+    "macos_bin": "clipboardwire-0.5.4-lazy-macos-aarch64",
+    "windows_exe": "clipboardwire-0.5.4-lazy-windows-x86_64.exe",
+    "sha256_macos_bin": "01341b1eba91a03a5de19fb7f73304d08878e1ad8aa41aef54b42c2d5490ccf4",
+    "sha256_windows_exe": "1b6e8535330b3ee88af76cc689a643312bc1017059501f3c5e668a282ba05694",
+    "windows_caveat": "First Windows build that ever compiled. Cross-compiled on macOS (x86_64-pc-windows-gnu, mingw) and never executed. No MSI -- that needs CI's WiX on windows-latest."
   },
 
   "remaining": {
-    "phase6_7": "BLOCKED on the user's spikes 0.1 (macOS NSFilePromiseProvider) and 0.2 (Windows IStream)",
-    "defaults_flip": "send_mode/receive_mode still eager; flipping before paste is proven would ship an unusable default on Windows/macOS",
+    "phase6_7": "BLOCKED on user spikes 0.1 (macOS NSFilePromiseProvider) and 0.2 (Windows IStream/STA)",
+    "defaults_flip": "send_mode/receive_mode still eager; cannot flip before paste is proven",
     "known_debt": [
       "ReceiveMode::Paste accepted by config, no platform path implements it",
       "pickup has an engine but no tray menu item",
-      "ClientConfig.tls_ca_file looks redaction-mangled, renaming breaks configs",
-      "phase2 fixture never passes through send_file_through",
+      "ClientConfig.tls_ca_file looks redaction-mangled; renaming breaks configs",
+      "drain_and_finish now runs in production but only the 64 KiB single-frame case is covered; a multi-frame queued-shutdown case is untested",
+      "offer notification dropped when a peer's frame buffer is full (offer itself remains pullable)",
       "build/ and dist/ untracked and unignored"
-    ]
+    ],
+    "ci_gap": "ci.yml runs on push to main and on PR only, so this branch never triggered it -- which is why the Windows compile break went unseen. Consider adding a windows check to any branch run."
   },
-  "next_action": "on result: verify the fallback actually emits chunks rather than nothing, then update PROTOCOL.md 3.4 and commit docs + fan-out + this gate together"
+
+  "user_field_test_failed": {
+    "report": "File transfer does not work at all, tested on the local Mac and on XS-OFFICE, through hub 192.168.31.102.",
+    "second_machine": "XS-OFFICE is Windows. Both ends therefore run the same lazy path: send_mode=lazy on the Mac, and receive_mode=auto resolves to Pickup on Windows exactly as it does on macOS (config.rs:163-176). One defect explains both directions, and Windows adds a second problem below.",
+    "user_config": "send_mode = \"lazy\", receive_mode = \"auto\" (resolves to Pickup on macOS), tls_insecure = true",
+    "root_cause": "LazyAssembler is built only from receive_policy.save_dir, and that field is hardcoded None at ReceivePolicy::from_config (core/src/client/mod.rs:387). run_with_status passes None down through run_supervisor_with_options, so the assembler is never created and every file_digest takes the 'digest arrived but no save dir is configured' branch that discards the session. Eager survives because FileReceiver::new() calls default_save_dir() itself -- the two receive paths disagree about what `None` means.",
+    "log_evidence": "2026-10-29T06:12:14 WARN clipboardwire_core::client: digest arrived but no save dir is configured. Text clip passthrough worked throughout the same session, which is why the user saw 'clipboard works, files do not'.",
+
+    "windows_specific_risk_not_yet_confirmed": "The Windows .exe I shipped (06e4426, cross-compiled on macOS) has never been executed by anyone. It compiles and `file` reports PE32+, but nothing more is known. If XS-OFFICE produces no clipboardwire.log.2026-10-29 at all, that points at a runtime failure rather than the save_dir defect, and the two need to be told apart before concluding a single fix covers both.",
+
+    "why_my_verification_missed_it": "My end-to-end checks used `clipboardwire send`, which transmits eager chunks, so the receiver went through FileReceiver (which resolves its own dir) and the bytes landed correctly. The GUI path with send_mode=lazy takes the offer/LazyAssembler route, which was never exercised by any check I ran.",
+    "why_tests_missed_it": "core/tests/lazy_transfer.rs:710 passes save_dir: Some(recv_dir) explicitly, so the hub end-to-end test proved 'works when a dir is supplied' and never 'works when the production caller supplies none'.",
+    "fix_dispatched": "cw-fix-lazy-save-dir: make None mean the platform default on both receive paths (prefer one shared resolution rather than two), keep the warn branch honest or delete it if unreachable, and add a regression test that deliberately does NOT pass save_dir and that fails when the fix is reverted."
+  },
+
+  "next_action": "On cw-fix-lazy-save-dir result: verify the mutation myself, rebuild macOS + Windows artifacts, reinstall locally, and ask the user to retest. Also ask the user whether XS-OFFICE wrote a clipboardwire.log.2026-10-29 file (that log proves the exe starts at all, and separates a runtime failure from the save_dir defect) and whether WARN lines mention the offer/pull/fan-out path rather than 'no save dir'. Nothing gets reported as fixed until the new test fails without the fix."
 }

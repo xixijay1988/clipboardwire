@@ -27,6 +27,16 @@ So for every delegation:
      `~/.lody/orchestration/*/operations.sqlite3`. That bypasses delivery and
      produces results the harness does not know were consumed.
 
+   This rule was broken in the session that produced the v0.4 test builds: after
+   dispatching the Windows-compile fix the lead called `wait` five times in a
+   row, the last few after the child had already finished, and the user had to
+   interrupt. Each `wait` burned a full timeout and returned nothing. The
+   dispatch call itself is the *last* action of the turn; anything after it
+   except the state-file write is a mistake.
+   - Corollary: if a dispatch call fails (`INTERNAL_ERROR`, `fetch failed`), do
+     not fall back to waiting or polling. Retry the dispatch, or stop and report.
+     A failed dispatch is not a pending one.
+
 3. **Persist loop state outside the conversation** so the next inbound turn can
    resume. Use `openspec/changes/<change-id>/.delegation.json`:
 
