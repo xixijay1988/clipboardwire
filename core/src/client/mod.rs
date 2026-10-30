@@ -539,48 +539,74 @@ fn request_next_window(
 
 /// Discard a broken session and, if the budget allows, start over.
 ///
-/// A restart always begins at index 0 under a new `transfer_id`: the digest
-/// covers the whole file, so a resume could never validate.
+/// With `seed` (the session that just failed) the new session *resumes*: it
+/// keeps the bitmap and asks only for the window that died, so a transfer
+/// interrupted at 90% does not re-download the 90% it already has. The digest
+/// still covers the whole file — resuming only changes how the bytes get
+/// here, never what they are checked against. Without a seed the bitmap is
+/// gone and the only honest restart is from index 0.
 #[allow(clippy::too_many_arguments)]
 fn restart_receive(
     receives: &mut receive::ReceiveEngine,
     assembler: &mut Option<receive::LazyAssembler>,
     transport: &Transport,
     file_id: &Uuid,
+    seed: Option<receive::ReceiveSession>,
     window: u32,
     log_file_names: bool,
 ) {
-    // The bytes written so far are unusable: the digest will cover the file
-    // from zero, and leaving the partial file in place is only correct if the
-    // restart overwrites it — which `LazyAssembler` does by truncating on
-    // reopen. Discard anyway so a failed restart does not leave litter.
-    if let Some(assembler) = assembler.as_mut() {
-        assembler.discard(file_id);
-    }
-
-    let used = receives.restarts_used(file_id);
-    if used >= receive::MAX_RESTARTS {
-        warn!(
-            file_id = %file_id,
-            restarts = used,
-            "giving up on a lazy transfer after too many restarts"
-        );
-        return;
-    }
     let Some(shape) = receives.shape(file_id).cloned() else {
         // Without the offer's shape a restart cannot be built: the failed
         // session is gone and nothing else remembers what it was pulling.
         debug!(file_id = %file_id, "no remembered offer to restart from");
+        if let Some(assembler) = assembler.as_mut() {
+            assembler.discard(file_id);
+        }
         return;
     };
+    // The engine counts its own restarts (a hole in the stream, a digest
+    // that arrived early) before it ever reaches this function — those
+    // callers pass `seed: None`. A session dropped *here* — a tail stall,
+    // an abort — was never counted, so count it now. Skipping the count is
+    // what used to let this path re-download a file from zero on every
+    // flap, forever.
+    if seed.is_some() && receives.bump_restart(*file_id).is_none() {
+        warn!(
+            file_id = %file_id,
+            restarts = receives.restarts_used(file_id),
+            "giving up on a lazy transfer after too many restarts"
+        );
+        if let Some(assembler) = assembler.as_mut() {
+            assembler.discard(file_id);
+        }
+        return;
+    }
     let _ = window;
-    let transfer_id = receives.open(*file_id, shape.clone(), now_millis());
-    debug!(
-        file_id = %file_id,
-        %transfer_id,
-        file = %crate::logging::redact_file_name(&shape.name, log_file_names),
-        "restarting a lazy transfer from index 0"
-    );
+    let transfer_id = match seed {
+        Some(old) => {
+            debug!(
+                file_id = %file_id,
+                file = %crate::logging::redact_file_name(&shape.name, log_file_names),
+                from_chunk = old.contiguous,
+                total = old.total_chunks,
+                "resuming a lazy transfer where it stopped"
+            );
+            receives.resume(old, now_millis())
+        }
+        None => {
+            // No usable bitmap: the partial on disk cannot be trusted to
+            // line up, so start clean rather than assemble garbage.
+            if let Some(assembler) = assembler.as_mut() {
+                assembler.discard(file_id);
+            }
+            debug!(
+                file_id = %file_id,
+                file = %crate::logging::redact_file_name(&shape.name, log_file_names),
+                "restarting a lazy transfer from index 0"
+            );
+            receives.open(*file_id, shape.clone(), now_millis())
+        }
+    };
     request_next_window(
         &mut *receives,
         &transport.outbound_control_tx,
@@ -703,6 +729,12 @@ pub async fn run_supervisor_with_policy(
     // user doesn't notice a "single file" copy as laggy.
     let mut pending_files: Vec<std::path::PathBuf> = Vec::new();
     let mut pending_deadline: Option<tokio::time::Instant> = None;
+
+    // Sessions dropped by a `file_abort`, waiting one tick for their restart.
+    // Retrying inside the abort arm would burn the whole restart budget in
+    // milliseconds against a still-full queue; the 1 s receive tick is the
+    // backoff.
+    let mut pending_restarts: Vec<receive::ReceiveSession> = Vec::new();
 
     // Lives across clipboard events, not inside one: reusing a `file_id` for an
     // unchanged path is the whole point of supersession, and that requires
@@ -959,6 +991,11 @@ pub async fn run_supervisor_with_policy(
                                     &mut assembler,
                                     &transport,
                                     &file_id,
+                                    // The engine already dropped the broken
+                                    // session — and already counted the
+                                    // restart — so there is no bitmap to
+                                    // resume from.
+                                    None,
                                     receive_policy.pull_window_chunks,
                                     log_file_names,
                                 );
@@ -1082,8 +1119,18 @@ pub async fn run_supervisor_with_policy(
                                 mode = ?receive_policy.resolved_mode(),
                                 "offer noted; mode does not pull automatically"
                             );
-                        } else if receives.has_session_for(&offer.file_id) {
-                            debug!(file_id = %offer.file_id, "already pulling this file");
+                        } else if receives.has_session_for(&offer.file_id)
+                            || receives.shape(&offer.file_id).is_some()
+                        {
+                            // A pull is in flight, or this exact offer was
+                            // answered before (completed, aborted mid-file, a
+                            // restart waiting on the tick). The second case is
+                            // what `welcome.offers` replays produce: `file_id`
+                            // identifies (path, identity), so a replay of an
+                            // answered offer is always a duplicate — and
+                            // pulling it again would drop a fresh copy into
+                            // Downloads on every reconnect.
+                            debug!(file_id = %offer.file_id, "already engaged this offer");
                         } else {
                             let from_device = match offer.from_device {
                                 Some(device) => device,
@@ -1190,6 +1237,7 @@ pub async fn run_supervisor_with_policy(
                                     &mut assembler,
                                     &transport,
                                     &digest.file_id,
+                                    None,
                                     receive_policy.pull_window_chunks,
                                     log_file_names,
                                 );
@@ -1205,11 +1253,22 @@ pub async fn run_supervisor_with_policy(
                         // never by the reason string (spec §Transfer sessions).
                         match abort.transfer_id {
                             Some(transfer_id) => {
-                                if receives.drop_session(&transfer_id).is_some() {
-                                    if let Some(assembler) = assembler.as_mut() {
-                                        assembler.discard(&abort.file_id);
-                                    }
-                                    debug!(%transfer_id, reason = %abort.reason, "session aborted");
+                                // Session-scoped: the pull died, the offer did
+                                // not. The reasons that reach here (`busy`,
+                                // `unknown_offer`, `invalid_start`,
+                                // `source_gone`, `expired`) all describe a
+                                // dead *attempt*, not a retracted file, so the
+                                // session's bitmap is still valid — hand it to
+                                // the restart queue instead of throwing the
+                                // whole transfer away, which is what used to
+                                // turn one dropped window into a lost file.
+                                if let Some(old) = receives.drop_session(&transfer_id) {
+                                    debug!(
+                                        %transfer_id,
+                                        reason = %abort.reason,
+                                        "session aborted; restart pending"
+                                    );
+                                    pending_restarts.push(old);
                                 }
                             }
                             None => {
@@ -1242,6 +1301,22 @@ pub async fn run_supervisor_with_policy(
             }
             _ = receive_tick.tick() => {
                 let now = now_millis();
+                // Aborted sessions restart here, one tick after the abort:
+                // far enough apart that a `busy` answer is not retried into
+                // a still-full queue, close enough that a dropped transfer
+                // does not visibly stall.
+                for old in std::mem::take(&mut pending_restarts) {
+                    let file_id = old.file_id;
+                    restart_receive(
+                        &mut receives,
+                        &mut assembler,
+                        &transport,
+                        &file_id,
+                        Some(old),
+                        receive_policy.pull_window_chunks,
+                        log_file_names,
+                    );
+                }
                 for (transfer_id, reason) in receives.stale(now) {
                     match reason {
                         receive::StaleReason::TailStall => {
@@ -1249,14 +1324,14 @@ pub async fn run_supervisor_with_policy(
                                 %transfer_id,
                                 "pulled transfer stalled mid-file; restarting"
                             );
-                            if let Some(file_id) =
-                                receives.session(&transfer_id).map(|s| s.file_id)
-                            {
+                            if let Some(old) = receives.drop_session(&transfer_id) {
+                                let file_id = old.file_id;
                                 restart_receive(
                                     &mut receives,
                                     &mut assembler,
                                     &transport,
                                     &file_id,
+                                    Some(old),
                                     receive_policy.pull_window_chunks,
                                     log_file_names,
                                 );

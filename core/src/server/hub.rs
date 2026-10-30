@@ -928,6 +928,24 @@ impl Hub {
                 reply,
             } => {
                 abort.from_device = self.clients.get(&from).map(|peer| peer.device);
+                // An offer-scoped abort retracts the offer itself: drop the
+                // stored copy so `welcome` does not replay an offer the source
+                // can no longer serve — a superseded file would otherwise stay
+                // pullable-by-replay until its TTL. `from_device` was just
+                // stamped with the sender's own registered device, so a client
+                // can only ever retract *its own* offers. Session-scoped
+                // aborts (transfer_id set) kill one attempt, not the offer.
+                if abort.transfer_id.is_none() {
+                    if let Some(owner) = abort.from_device {
+                        if self.offers.remove(&(owner, abort.file_id)).is_some() {
+                            debug!(
+                                file_id = %abort.file_id,
+                                %owner,
+                                "offer retracted by its owner"
+                            );
+                        }
+                    }
+                }
                 // Read the target out before moving `abort` into a frame; `Copy`
                 // on `Option<Uuid>` keeps this a borrow of nothing in particular.
                 let target = abort.to;

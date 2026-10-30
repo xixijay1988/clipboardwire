@@ -533,9 +533,13 @@ async fn connect_and_serve(
         "welcomed"
     );
 
-    // `peers` and `offers` are only logged for now; feeding them to the
-    // supervisor is Phase 5. They are parsed out regardless so that "what the
-    // hub said" is never lost between here and there.
+    // `peers` is only logged for now. `offers`, by contrast, must be fed to
+    // the supervisor: a broadcast offer only reaches the peers connected at
+    // that instant, so this replay is the *only* way a late-joining or
+    // reconnected client ever learns the file exists. Dropping it loses the
+    // transfer with no error on either side — the remote's clipboard simply
+    // stays old, which is exactly the "copied a file and nothing happened"
+    // failure that is impossible to debug from the sender's side.
     if welcome_is_inconsistent(&welcome) {
         warn!(
             offers = welcome.offers.len(),
@@ -543,6 +547,16 @@ async fn connect_and_serve(
             "hub sent offers without advertising lazy-file; the hub and its \
              own capability list disagree"
         );
+    }
+    if let Some(tx) = links.inbound_control_tx.as_ref() {
+        for offer in welcome.offers {
+            if tx.send(Frame::FileOffer(offer)).await.is_err() {
+                // The supervisor is gone: same condition as a closed clip
+                // channel, so end the connection rather than queue frames
+                // nobody will read.
+                return Ok(());
+            }
+        }
     }
 
     // Surface a cached clip (if any) to the supervisor as an inbound event.

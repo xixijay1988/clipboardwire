@@ -229,6 +229,27 @@ impl ReceiveEngine {
         Some((session.contiguous, self.window.min(remaining).max(1)))
     }
 
+    /// Re-open `old` under a fresh `transfer_id`, keeping its bitmap.
+    ///
+    /// A fresh [`Self::open`] zeroes the bitmap, which is what turns every
+    /// restart into a from-scratch re-download; a resumed session only
+    /// re-asks for the window that died (`in_flight` cleared) and carries on
+    /// from `contiguous`. The partial on disk stays aligned because the
+    /// assembler writes each chunk at its own offset.
+    pub fn resume(&mut self, old: ReceiveSession, now_ms: i64) -> Uuid {
+        let transfer_id = Uuid::new_v4();
+        self.sessions.insert(
+            transfer_id,
+            ReceiveSession {
+                transfer_id,
+                in_flight: None,
+                last_progress_ms: now_ms,
+                ..old
+            },
+        );
+        transfer_id
+    }
+
     /// Handle one inbound chunk.
     ///
     /// The order below is the whole design: a chunk that names an unknown
@@ -425,7 +446,11 @@ impl ReceiveEngine {
     }
 
     /// Count one restart against `file_id`. `None` when the budget is spent.
-    fn bump_restart(&mut self, file_id: Uuid) -> Option<u32> {
+    ///
+    /// Also used by the supervisor's stall/abort restart path: counting at
+    /// call time (rather than comparing `restarts_used` first) is what makes
+    /// the budget real — a check that never increments is not a cap.
+    pub fn bump_restart(&mut self, file_id: Uuid) -> Option<u32> {
         let count = self.restarts.entry(file_id).or_insert(0);
         *count += 1;
         if *count > MAX_RESTARTS {
