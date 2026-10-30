@@ -47,10 +47,13 @@ pub const DIGEST_WAIT_MS: i64 = 10_000;
 pub const MAX_RESTARTS: u32 = 3;
 
 /// What happened to one inbound chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkOutcome {
     /// Accept and write at this index.
     Accept { chunk_index: u32 },
+    /// This was the last missing chunk and a digest is already on file
+    /// (it overtook the tail chunks on the wire). Verify and publish.
+    Ready { sha256: String },
     /// Not our session, or from the wrong device: drop silently.
     Ignored,
     /// A gap or duplicate-from-another-session: the caller must abort and
@@ -67,8 +70,12 @@ pub enum DigestOutcome {
     Ready { sha256: String },
     /// Digest for a session we do not have: drop.
     Unknown,
-    /// Digest arrived but not every chunk did: the sender is confused.
-    Incomplete,
+    /// The digest arrived before every chunk — legal, not an error. The hub
+    /// routes chunks and digests through different per-peer queues, so the
+    /// digest genuinely overtakes the tail of a transfer whenever the
+    /// receiver falls behind. It is stored on the session; the pull keeps
+    /// going and the last chunk produces `ChunkOutcome::Ready`.
+    Early,
 }
 
 /// Why a session has gone quiet.
@@ -219,7 +226,10 @@ impl ReceiveEngine {
     /// Which pull to send next, if any.
     pub fn next_pull(&self, transfer_id: &Uuid) -> Option<(u32, u32)> {
         let session = self.sessions.get(transfer_id)?;
-        if session.digest.is_some() || session.in_flight.is_some() {
+        // A stored digest does NOT stop pulls: it may have overtaken the
+        // tail chunks, in which case the rest of the file still has to be
+        // asked for. `contiguous >= total_chunks` is the real stop.
+        if session.in_flight.is_some() {
             return None;
         }
         if session.contiguous >= session.total_chunks {
@@ -322,6 +332,13 @@ impl ReceiveEngine {
             session.contiguous += 1;
         }
         session.last_progress_ms = now_ms;
+        if session.contiguous >= total_chunks {
+            if let Some(sha256) = session.digest.clone() {
+                // Every byte is here and the digest already arrived — the
+                // wire reorder is fully absorbed; verify now.
+                return ChunkOutcome::Ready { sha256 };
+            }
+        }
         ChunkOutcome::Accept {
             chunk_index: chunk.chunk_index,
         }
@@ -338,18 +355,13 @@ impl ReceiveEngine {
         }
         session.last_progress_ms = now_ms;
 
-        if session.contiguous < session.total_chunks {
-            // The sender thinks it is done; we are missing bytes. Discard and
-            // start over rather than verifying a partial file.
-            let file_id = session.file_id;
-            self.sessions.remove(&digest.transfer_id);
-            // The restart counter advances either way; whether the budget is
-            // spent is the caller's next decision (it sees `restarts_used`).
-            let _ = self.bump_restart(file_id);
-            return DigestOutcome::Incomplete;
-        }
-
+        // Store it either way: the hash describes the whole file, so it is
+        // exactly what the tail end verifies against — regardless of whether
+        // the digest overtook the last chunks on the wire.
         session.digest = Some(digest.file_sha256.clone());
+        if session.contiguous < session.total_chunks {
+            return DigestOutcome::Early;
+        }
         DigestOutcome::Ready {
             sha256: digest.file_sha256.clone(),
         }
@@ -365,16 +377,17 @@ impl ReceiveEngine {
     pub fn stale(&self, now_ms: i64) -> Vec<(Uuid, StaleReason)> {
         let mut out = Vec::new();
         for (transfer_id, session) in &self.sessions {
-            if session.digest.is_some() {
-                continue;
-            }
             let idle = now_ms.saturating_sub(session.last_progress_ms);
             if session.contiguous >= session.total_chunks {
-                // Everything arrived; only the digest is outstanding.
-                if idle >= DIGEST_WAIT_MS {
+                // Everything arrived; only the digest is outstanding. A
+                // stored digest means the completion already fired, so a
+                // lingering session here is not stale — just not yet reaped.
+                if session.digest.is_none() && idle >= DIGEST_WAIT_MS {
                     out.push((*transfer_id, StaleReason::DigestWait));
                 }
             } else if session.in_flight.is_some() && idle >= TAIL_STALL_TIMEOUT_MS {
+                // Applies equally to a session holding an early digest: the
+                // hash being on file does not make the missing bytes arrive.
                 out.push((*transfer_id, StaleReason::TailStall));
             }
         }
@@ -779,7 +792,13 @@ mod tests {
     }
 
     #[test]
-    fn a_digest_for_an_incomplete_session_restarts() {
+    fn a_digest_that_overtakes_the_tail_chunks_is_stored_not_fatal() {
+        // The hub routes chunks and digests through different queues, so the
+        // digest overtaking the last chunks is ordinary, not corruption: on a
+        // receiver that falls behind it happens on most large transfers.
+        // Restarting here used to re-download the entire file once per
+        // reorder, which is what made large transfers effectively impossible
+        // over a lossy link.
         let (mut engine, transfer_id, file_id, device, _) = engine_with_session(5);
         engine.handle_chunk(&chunk(transfer_id, file_id, device, 0, 5), NOW);
 
@@ -790,16 +809,71 @@ mod tests {
             from_device: Some(device),
             file_sha256: "AA:BB".to_string(),
         };
+        assert_eq!(engine.handle_digest(&digest, NOW), DigestOutcome::Early);
         assert_eq!(
-            engine.handle_digest(&digest, NOW),
-            DigestOutcome::Incomplete
-        );
-        assert_eq!(engine.restarts_used(&file_id), 1);
-        assert_eq!(
-            engine.session_count(),
+            engine.restarts_used(&file_id),
             0,
-            "the partial session is discarded"
+            "an early digest must not spend the restart budget"
         );
+        // The session is kept and keeps pulling the missing windows.
+        assert!(engine.session(&transfer_id).is_some());
+        assert_eq!(engine.next_pull(&transfer_id), Some((1, 4)));
+
+        // Feed the rest; the last chunk turns the stored digest into Ready.
+        for index in 1..4 {
+            engine.handle_chunk(&chunk(transfer_id, file_id, device, index, 5), NOW);
+        }
+        let last = engine.handle_chunk(&chunk(transfer_id, file_id, device, 4, 5), NOW);
+        assert_eq!(
+            last,
+            ChunkOutcome::Ready {
+                sha256: "AA:BB".to_string()
+            },
+            "completing the file after an early digest must produce Ready"
+        );
+    }
+
+    #[test]
+    fn the_last_chunk_after_an_early_digest_completes_the_transfer() {
+        let (mut engine, transfer_id, file_id, device, _) = engine_with_session(5);
+        let digest = FileDigestFrame {
+            file_id,
+            transfer_id,
+            to: Uuid::new_v4(),
+            from_device: Some(device),
+            file_sha256: "CC:DD".to_string(),
+        };
+        assert_eq!(engine.handle_digest(&digest, NOW), DigestOutcome::Early);
+        for index in 0..4 {
+            let out = engine.handle_chunk(&chunk(transfer_id, file_id, device, index, 5), NOW);
+            assert!(!matches!(out, ChunkOutcome::Ready { .. }));
+        }
+        let out = engine.handle_chunk(&chunk(transfer_id, file_id, device, 4, 5), NOW);
+        assert_eq!(
+            out,
+            ChunkOutcome::Ready {
+                sha256: "CC:DD".to_string()
+            },
+            "the final chunk must surface the stored digest for verification"
+        );
+    }
+
+    #[test]
+    fn an_early_digest_does_not_hide_a_stall() {
+        let (mut engine, transfer_id, file_id, device, _) = engine_with_session(5);
+        let digest = FileDigestFrame {
+            file_id,
+            transfer_id,
+            to: Uuid::new_v4(),
+            from_device: Some(device),
+            file_sha256: "AA:BB".to_string(),
+        };
+        engine.handle_digest(&digest, NOW);
+        engine.mark_pulled(&transfer_id, 0, 5);
+        // The bytes never arrive: the session must still go TailStall — a
+        // stored digest cannot stand in for the missing data.
+        let stale = engine.stale(NOW + TAIL_STALL_TIMEOUT_MS);
+        assert_eq!(stale, vec![(transfer_id, StaleReason::TailStall)]);
     }
 
     #[test]

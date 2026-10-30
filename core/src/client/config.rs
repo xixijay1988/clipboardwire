@@ -215,7 +215,7 @@ pub fn is_default_pull_idle_timeout(secs: &u64) -> bool {
     *secs == default_pull_idle_timeout_secs()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HubConfig {
     /// Whether to bring up a hub on this machine alongside the client.

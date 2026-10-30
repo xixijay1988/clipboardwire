@@ -2,32 +2,45 @@
   "phase": "phase8-complete-and-test-builds",
   "builder_session": "b02422f4-9ad4-4ba3-aeb4-bc480a3c6d5f",
   "reviewer_session": "108fb788-f6b8-44f7-bf12-d892d73b4577",
-
   "process_correction": "All code changes go through Builder. Lead only reads, runs gates, greps, and edits openspec/ + AGENTS.md.",
-
   "lead_process_failure_this_stretch": {
     "what_i_did": "After dispatching cw-fix-windows-build I polled with the wait tool and lody_operation_get for ~5 consecutive waits, including after the child had already finished at 03:29. The user interrupted with 'the child finished long ago, what are you waiting for'.",
     "root_cause": "I treated `wait` as if it could observe an MCP operation. It cannot: an MCP operation is not a wake source, so wait runs its full timeout and tells me nothing. My own AGENTS.md says this explicitly ('Do not use the CLI wait tool to await an MCP operation').",
     "correct_behaviour": "Dispatch, write this file, emit one status line, END THE TURN. The result arrives as a new inbound turn.",
     "second_failure_same_stretch": "verify.sh tested for verify.bin while the receiver saves under the source file name (payload.bin). I shipped it without running it first; the first run reported 'nothing landed' while the log plainly showed 'received (done)'."
   },
-
   "commits": [
-    {"sha": "cdc50f0", "message": "feat: lazy file transfer protocol v0.4 (Phases 1-5)"},
-    {"sha": "e31a405", "message": "fix: publish offers to connected peers, and gate lazy sending on hub caps"},
-    {"sha": "de197b7", "message": "test: lazy transfer through a real hub; document the new internals"},
-    {"sha": "8f41a58", "message": "fix: make one-shot `send` exit after delivering the file"},
-    {"sha": "260d097", "message": "docs: correct ARCHITECTURE.md claims that had gone stale"},
-    {"sha": "06e4426", "message": "fix: make the Windows target compile again"}
+    {
+      "sha": "cdc50f0",
+      "message": "feat: lazy file transfer protocol v0.4 (Phases 1-5)"
+    },
+    {
+      "sha": "e31a405",
+      "message": "fix: publish offers to connected peers, and gate lazy sending on hub caps"
+    },
+    {
+      "sha": "de197b7",
+      "message": "test: lazy transfer through a real hub; document the new internals"
+    },
+    {
+      "sha": "8f41a58",
+      "message": "fix: make one-shot `send` exit after delivering the file"
+    },
+    {
+      "sha": "260d097",
+      "message": "docs: correct ARCHITECTURE.md claims that had gone stale"
+    },
+    {
+      "sha": "06e4426",
+      "message": "fix: make the Windows target compile again"
+    }
   ],
-
   "defects_found_this_stretch": {
     "offer_fanout_missing": "PublishOffer did register->insert->ACK with no broadcast, so an offer reached a peer only via welcome.offers at connect time. Two already-connected clients could never transfer. Fixed e31a405.",
     "hub_caps_not_gated": "welcome.caps was parsed but only logged, so a v0.4 sender against a v0.3 hub published offers nothing could pull. Fixed e31a405 (degrade to eager, one warning per connection).",
     "send_never_exits": "`let _ = transport.outbound_tx;` discards the place, not the value, so the sender stayed alive and the one-shot task never returned. Present since ffa2f414 (2026-05-21); means drain_and_finish had never run in production. Fixed 8f41a58.",
     "windows_target_does_not_compile": "offers.rs used MetadataExt::volume_serial_number/file_index, gated behind unstable windows_by_handle (issue 63010). The comment called them ordinary Option-returning methods; no released toolchain has them. Also i128::from(u128) which has never existed, and a #[cfg(unix)] inode_of called unconditionally from a test. Fixed 06e4426."
   },
-
   "verification_i_ran_myself": {
     "gate_condition_mutation": "Reverted main.rs to `let _ =` and reproduced: 'send did not exit within 15s ... stderr: ... transport: connected'. Restored, 445/0/5 green.",
     "windows_check": "cargo check --target x86_64-pc-windows-gnu -p clipboardwire: zero errors, zero warnings.",
@@ -35,7 +48,6 @@
     "end_to_end": "Real hub on loopback + lazy sender + pickup receiver, 12 MB: send rc=0 in 0s, SHA256 matched.",
     "verify_script": "dist-test/verify.sh self-tested to PASS before shipping (after fixing the filename bug above)."
   },
-
   "test_builds_delivered": {
     "macos_app_tar": "clipboardwire-0.5.4-lazy-macos-aarch64.app.tar.gz",
     "macos_bin": "clipboardwire-0.5.4-lazy-macos-aarch64",
@@ -44,7 +56,6 @@
     "sha256_windows_exe": "1b6e8535330b3ee88af76cc689a643312bc1017059501f3c5e668a282ba05694",
     "windows_caveat": "First Windows build that ever compiled. Cross-compiled on macOS (x86_64-pc-windows-gnu, mingw) and never executed. No MSI -- that needs CI's WiX on windows-latest."
   },
-
   "remaining": {
     "phase6_7": "BLOCKED on user spikes 0.1 (macOS NSFilePromiseProvider) and 0.2 (Windows IStream/STA)",
     "defaults_flip": "send_mode/receive_mode still eager; cannot flip before paste is proven",
@@ -58,37 +69,51 @@
     ],
     "ci_gap": "ci.yml runs on push to main and on PR only, so this branch never triggered it -- which is why the Windows compile break went unseen. Consider adding a windows check to any branch run."
   },
-
   "user_field_test_failed": {
     "report": "File transfer does not work at all, tested on the local Mac and on XS-OFFICE, through hub 192.168.31.102.",
     "second_machine": "XS-OFFICE is Windows. Both ends therefore run the same lazy path: send_mode=lazy on the Mac, and receive_mode=auto resolves to Pickup on Windows exactly as it does on macOS (config.rs:163-176). One defect explains both directions, and Windows adds a second problem below.",
     "user_config": "send_mode = \"lazy\", receive_mode = \"auto\" (resolves to Pickup on macOS), tls_insecure = true",
     "root_cause": "LazyAssembler is built only from receive_policy.save_dir, and that field is hardcoded None at ReceivePolicy::from_config (core/src/client/mod.rs:387). run_with_status passes None down through run_supervisor_with_options, so the assembler is never created and every file_digest takes the 'digest arrived but no save dir is configured' branch that discards the session. Eager survives because FileReceiver::new() calls default_save_dir() itself -- the two receive paths disagree about what `None` means.",
     "log_evidence": "2026-10-29T06:12:14 WARN clipboardwire_core::client: digest arrived but no save dir is configured. Text clip passthrough worked throughout the same session, which is why the user saw 'clipboard works, files do not'.",
-
     "windows_specific_risk_not_yet_confirmed": "The Windows .exe I shipped (06e4426, cross-compiled on macOS) has never been executed by anyone. It compiles and `file` reports PE32+, but nothing more is known. If XS-OFFICE produces no clipboardwire.log.2026-10-29 at all, that points at a runtime failure rather than the save_dir defect, and the two need to be told apart before concluding a single fix covers both.",
-
     "why_my_verification_missed_it": "My end-to-end checks used `clipboardwire send`, which transmits eager chunks, so the receiver went through FileReceiver (which resolves its own dir) and the bytes landed correctly. The GUI path with send_mode=lazy takes the offer/LazyAssembler route, which was never exercised by any check I ran.",
     "why_tests_missed_it": "core/tests/lazy_transfer.rs:710 passes save_dir: Some(recv_dir) explicitly, so the hub end-to-end test proved 'works when a dir is supplied' and never 'works when the production caller supplies none'.",
     "fix_dispatched": "cw-fix-lazy-save-dir: make None mean the platform default on both receive paths (prefer one shared resolution rather than two), keep the warn branch honest or delete it if unreachable, and add a regression test that deliberately does NOT pass save_dir and that fails when the fix is reverted."
   },
-
   "intermittent_copy_failure_investigation": {
     "user_report": "Copying files sometimes fails.",
     "loop": "/tmp/cw-repro2.sh plus /tmp/cw-setpb2 (Objective-C NSPasteboard writer, because osascript sets an alias record and pbcopy cannot carry public.file-url). Confirmed premise first with a direct probe: after deleting a file, `the clipboard as «class furl»` still names the dead path.",
-
     "defect_1_dedup_swallows_recopy_of_a_changed_file": {
       "mechanism": "clipboard.rs decide() dedupes on the path list alone: `if seen.files.as_deref() == Some(paths.as_slice()) { return None; }`. If the user copies a file, deletes or moves it, then copies the same path again, the paths are identical, so no ClipChange::Files is emitted, no offer is published, and NOTHING is logged. From the user's side the copy silently did nothing -- which is exactly the 'sometimes' shape.",
       "evidence": "Reproduced with a real hub: two offers sent for a.txt and b.txt; after `rm b.txt` the same path was put back on the pasteboard and no third offer was sent, and no warning appeared.",
       "why_dedup_exists": "It prevents re-publishing an unchanged file on every poll tick, which would mint a new file_id every 300 ms. The rule needs to distinguish 'same path, unchanged bytes' from 'same path, different bytes'. PinnedIdentity already makes that comparison possible at advertise time; the clipboard layer just never looks at it again."
     },
-
     "defect_2_statfailed_is_reported_but_not_surfaced": {
       "mechanism": "When a path dies between the clipboard read and publish, advertise() returns SkipReason::StatFailed and the supervisor logs a redacted WARN. The user gets no visible feedback in the tray and the copy simply does not happen.",
       "real_log": "2026-10-29T06:44:18 WARN skipping file in offer file=file#05b63e105a089643 reason=StatFailed(No such file or directory); repeated at 06:44:27 for the same id.",
       "note": "The log evidence also shows this fired immediately after a reconnect (No route to host at 06:44:13), so it is not only user-driven deletion."
     },
-
     "next_action": "Dispatch one builder task for defect 1 (silent dedupe) with the repro above as the acceptance case, and one decision for defect 2 (whether a failed copy should be visible in the tray). Do not fix by hand: both live in core/src."
+  },
+  "investigation_2026_10_30": {
+    "session": "devin session b6091187 on dawn-MacBookAir (this session)",
+    "round": 1,
+    "pending_operation": "cw-xs-office-disconnect-diag",
+    "last_result": "fix committed locally: 592a999 (welcome.offers forwarded; replay dedup; abort->resume restart; hub retracts aborted offers). Tests: 3 new in core/tests/welcome_offers_replay.rs; full suite green, clippy/fmt clean.",
+    "user_symptoms": "copied files often cannot paste on remote (old clipboard stays); large files fail; 'does not seem lazy'; very unstable (~17 close_notify TCP drops on 2026-10-29)",
+    "fixed_already": [
+      "welcome.offers parsed but dropped by client transport -> offers published while peer offline/reconnecting were permanently lost. Reproduced red->green (welcome_offers_replay.rs).",
+      "session-scoped file_abort killed transfer with no retry; restart budget never applied to stall path AND restarts re-downloaded from index 0. Now resumes from contiguous.",
+      "hub kept retracted (superseded) offers in registry -> replayed to late joiners. Now removed on owner offer-scoped abort."
+    ],
+    "still_open": [
+      "root cause of the ~17 TCP-level close_notify drops on 2026-10-29 (04:00,06:02,07:24,08:04 UTC) - delegated to XS-Office session for remote-side evidence",
+      "eager broadcast chunk drop on hub queue Full is silent (corrupt file, no abort marker) - code-confirmed, not yet fixed",
+      "hub_caps empty before first welcome -> copies in that window downgrade to eager + misleading 'for this and later copies' warn - minor",
+      "restart_or_fail (chunk-hole/digest-incomplete) path still restarts from index 0 - bitmap destroyed inside engine",
+      "directory copies are skipped by design (tray shows Failed since a27bccc)",
+      "MAX_RESTARTS=3 budget now also caps stall/abort resumes - under a sustained outage a transfer gives up after ~3 resumes"
+    ],
+    "next_action": "when cw-xs-office-disconnect-diag returns, correlate its log/process findings with the Mac-side drop timestamps and decide whether drops are hub-process restarts, machine sleep, or network; do not edit core/src/cli/src from this session if a builder role is reassigned"
   }
 }

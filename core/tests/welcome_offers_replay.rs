@@ -452,3 +452,87 @@ async fn a_replayed_offer_for_a_finished_pull_is_ignored() {
     join.abort();
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The wire does not preserve order between chunk and control queues, so the
+/// digest legitimately overtakes the tail chunks on a receiver that falls
+/// behind. Treating that as corruption used to re-download the whole file on
+/// every reorder — on a busy receiver, on most large transfers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_digest_that_overtakes_the_last_chunk_still_completes() {
+    let dir = unique_dir("early-digest");
+    let (mut wire, join) = mock_supervisor(dir.clone());
+    let device = Uuid::new_v4();
+    let file_id = Uuid::new_v4();
+    // Chunk 0 must carry a full FILE_CHUNK_BYTES payload: the assembler
+    // writes each chunk at index*FILE_CHUNK_BYTES, so a short middle chunk
+    // would leave a hole of zeros and the file would not verify.
+    let payload = vec![0xABu8; FILE_CHUNK_BYTES];
+    let payload2 = b"second half".to_vec();
+    let mut whole = payload.clone();
+    whole.extend_from_slice(&payload2);
+    let size = (FILE_CHUNK_BYTES + payload2.len()) as u64;
+
+    wire.inbound_control_tx
+        .send(offer(file_id, device, size))
+        .await
+        .unwrap();
+    let p0 = next_pull(&mut wire.outbound_control_rx, "window 0").await;
+    wire.inbound_files_tx
+        .send(chunk(file_id, p0.transfer_id, device, 0, 2, size, &payload))
+        .await
+        .unwrap();
+    let p1 = next_pull(&mut wire.outbound_control_rx, "window 1").await;
+
+    // The digest arrives BEFORE the final chunk — the wire reorder.
+    let sha = colon_hex(&sha2::Sha256::digest(&whole));
+    wire.inbound_control_tx
+        .send(Frame::FileDigest(FileDigestFrame {
+            file_id,
+            transfer_id: p1.transfer_id,
+            to: device,
+            from_device: Some(device),
+            file_sha256: sha,
+        }))
+        .await
+        .unwrap();
+
+    // No restart must be attempted — no pull frames for the old session.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), wire.outbound_control_rx.recv())
+            .await
+            .is_err(),
+        "an early digest must not trigger a restart pull"
+    );
+
+    // The last chunk lands: file must verify against the stored digest and be saved.
+    wire.inbound_files_tx
+        .send(chunk(
+            file_id,
+            p1.transfer_id,
+            device,
+            1,
+            2,
+            size,
+            &payload2,
+        ))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            if let Some(e) = entries.flatten().find(|e| {
+                e.path().is_file() && !e.file_name().to_string_lossy().ends_with(".partial")
+            }) {
+                assert_eq!(fs::read(e.path()).unwrap(), whole);
+                break;
+            }
+        }
+        assert!(std::time::Instant::now() <= deadline, "file never landed");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    drop(wire.events_tx);
+    drop(wire.inbound_control_tx);
+    join.abort();
+    let _ = fs::remove_dir_all(&dir);
+}

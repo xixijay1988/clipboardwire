@@ -187,6 +187,13 @@ struct State {
     /// The embedded hub spawned from `[hub]` in the client config.
     embedded_hub: Option<JoinHandle<Result<()>>>,
     embedded_hub_gen: u64,
+    /// The `[hub]` section the running hub was started with, and the address
+    /// it actually bound. A config reload compares the freshly loaded section
+    /// against this snapshot: identical means the running hub already serves
+    /// exactly what the new config asks for, so it must not be rebound —
+    /// every rebind kills all connected peers.
+    embedded_hub_cfg: Option<clipboardwire_core::client::config::HubConfig>,
+    embedded_hub_addr: Option<std::net::SocketAddr>,
     /// Set when the most recent hub-bind attempt failed (e.g. another
     /// process is on the same port). Shown in the tray status line so
     /// the user doesn't have to read the log to understand why nothing
@@ -445,6 +452,8 @@ pub fn run(
         transfer_clear_at: Vec::new(),
         embedded_hub: None,
         embedded_hub_gen: 0,
+        embedded_hub_cfg: None,
+        embedded_hub_addr: None,
         hub_bind_error: None,
         hub_stats: None,
         hub_stats_poller: None,
@@ -496,7 +505,7 @@ pub fn run(
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 if menu_event.id == quit_id {
                     info!("Quit menu item clicked");
-                    abort_running(&mut state);
+                    abort_running(&mut state, false);
                     *control_flow = ControlFlow::Exit;
                 } else if menu_event.id == edit_id {
                     if state.settings_alive {
@@ -511,7 +520,8 @@ pub fn run(
                         }
                     }
                 } else if menu_event.id == reload_id {
-                    abort_running(&mut state);
+                    let keep_hub = hub_restart_unneeded(&state, &config_path);
+                    abort_running(&mut state, keep_hub);
                     reload_config_into(&mut state, &config_path);
                     apply_loaded_config(runtime.handle(), &proxy, &mut state, &config_path, &tray);
                     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
@@ -598,6 +608,8 @@ pub fn run(
                 summary,
             }) if Some(generation) == current_hub_gen(&state) => {
                 state.embedded_hub = None;
+                state.embedded_hub_cfg = None;
+                state.embedded_hub_addr = None;
                 warn!(gen = generation, summary, "embedded hub exited on its own");
                 update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
             }
@@ -630,7 +642,8 @@ pub fn run(
             Event::UserEvent(UserEvent::SettingsExited) => {
                 info!("settings dialog closed; auto-reloading config");
                 state.settings_alive = false;
-                abort_running(&mut state);
+                let keep_hub = hub_restart_unneeded(&state, &config_path);
+                abort_running(&mut state, keep_hub);
                 reload_config_into(&mut state, &config_path);
                 apply_loaded_config(runtime.handle(), &proxy, &mut state, &config_path, &tray);
                 update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
@@ -674,18 +687,26 @@ fn current_hub_gen(state: &State) -> Option<u64> {
     state.embedded_hub.as_ref().map(|_| state.embedded_hub_gen)
 }
 
-/// Tear down both the supervisor and the embedded hub. Used before a
-/// reload, before quit, and in the settings-exit handler.
-fn abort_running(state: &mut State) {
+/// Tear down the supervisor, and the embedded hub too unless `keep_hub` —
+/// a reload whose `[hub]` section did not change must not rebind, because
+/// every rebind kills all connected peers with a bare TCP close.
+fn abort_running(state: &mut State, keep_hub: bool) {
     if let Some(s) = state.supervisor.take() {
         s.abort();
     }
-    if let Some(h) = state.embedded_hub.take() {
-        h.abort();
+    if !keep_hub {
+        if let Some(h) = state.embedded_hub.take() {
+            h.abort();
+        }
+        state.embedded_hub_cfg = None;
+        state.embedded_hub_addr = None;
+        state.hub_stats = None;
+        if let Some(p) = state.hub_stats_poller.take() {
+            p.abort();
+        }
     }
     state.client_status = None;
     state.hub_bind_error = None;
-    state.hub_stats = None;
     // Retire the generation *before* clearing the list. A forwarder task that
     // outlives `abort()` can still deliver events already buffered in the
     // broadcast channel; without this bump they would pass the
@@ -699,8 +720,22 @@ fn abort_running(state: &mut State) {
     // "receiving 33%" in the tooltip until the process exits.
     state.transfers.clear();
     state.transfer_clear_at.clear();
-    if let Some(p) = state.hub_stats_poller.take() {
-        p.abort();
+}
+
+/// Whether the reload can keep the running embedded hub: the file parses and
+/// its `[hub]` section is identical to the snapshot the running hub was
+/// started with. Anything else — unreadable file, changed bind/TLS/auth,
+/// disabled hub, or no hub running — takes the restart path, which is the
+/// same behaviour as before. The only thing being avoided is a pointless
+/// rebind: closing the listener drops every connected peer, and a config
+/// reload used to do it on every save.
+fn hub_restart_unneeded(state: &State, config_path: &Path) -> bool {
+    if state.embedded_hub.is_none() {
+        return false;
+    }
+    match ClientConfig::load(config_path) {
+        Ok(new_cfg) => new_cfg.hub == state.embedded_hub_cfg,
+        Err(_) => false,
     }
 }
 
@@ -738,10 +773,21 @@ fn apply_loaded_config(
     let mut client_cfg = client_cfg_orig.clone();
 
     // If [hub] enabled, start the embedded hub first and rewrite the
-    // client's server URL to point at it.
+    // client's server URL to point at it. When the running hub was started
+    // from an identical `[hub]` section there is nothing to do but the URL
+    // rewrite: rebinding the listener is what drops every connected peer, so
+    // it must only ever happen when the hub config actually changed.
     let hub_enabled = client_cfg.hub.as_ref().is_some_and(|h| h.enabled);
     if hub_enabled {
-        if let Err(e) =
+        let already_serving =
+            state.embedded_hub.is_some() && client_cfg.hub == state.embedded_hub_cfg;
+        if already_serving {
+            if let (Some(hub_cfg), Some(addr)) =
+                (state.embedded_hub_cfg.as_ref(), state.embedded_hub_addr)
+            {
+                point_client_at_hub(&mut client_cfg, hub_cfg.tls_disabled, addr);
+            }
+        } else if let Err(e) =
             start_embedded_hub_with_cfg(handle, proxy, state, &mut client_cfg, config_path)
         {
             warn!(
@@ -863,7 +909,7 @@ fn start_embedded_hub_with_cfg(
 ) -> Result<()> {
     let hub_cfg = client_cfg
         .hub
-        .as_ref()
+        .clone()
         .context("config has no [hub] section")?;
     let mut server_cfg = hub_cfg.to_server_config();
     // Default the auto-gen cert location to the config file's parent
@@ -892,18 +938,11 @@ fn start_embedded_hub_with_cfg(
     };
     info!(addr = %addr, "embedded hub bound");
 
-    let scheme = if !server_cfg.tls_disabled {
-        "wss"
-    } else {
-        "ws"
-    };
-    client_cfg.server = format!("{scheme}://127.0.0.1:{}/sync", addr.port());
-    // Loopback hop: cert SAN never covers 127.0.0.1 for arbitrary
-    // server certs, and we don't auto-pin the generated self-signed
-    // cert at the client level. Trust the loopback.
-    if !server_cfg.tls_disabled {
-        client_cfg.tls_insecure = true;
-    }
+    point_client_at_hub(client_cfg, server_cfg.tls_disabled, addr);
+    // Record what this hub is serving so a later reload can tell "same
+    // config, keep it alive" from "config changed, rebind".
+    state.embedded_hub_cfg = Some(hub_cfg.clone());
+    state.embedded_hub_addr = Some(addr);
 
     state.embedded_hub_gen += 1;
     let gen = state.embedded_hub_gen;
@@ -952,11 +991,30 @@ fn start_embedded_hub_with_cfg(
     Ok(())
 }
 
+/// Point a client config at a running embedded hub.
+///
+/// Loopback hop: cert SAN never covers 127.0.0.1 for arbitrary server certs,
+/// and we don't auto-pin the generated self-signed cert at the client level.
+/// Trust the loopback.
+fn point_client_at_hub(
+    client_cfg: &mut ClientConfig,
+    tls_disabled: bool,
+    addr: std::net::SocketAddr,
+) {
+    let scheme = if !tls_disabled { "wss" } else { "ws" };
+    client_cfg.server = format!("{scheme}://127.0.0.1:{}/sync", addr.port());
+    if !tls_disabled {
+        client_cfg.tls_insecure = true;
+    }
+}
+
 fn stop_embedded_hub(state: &mut State) {
     if let Some(h) = state.embedded_hub.take() {
         h.abort();
         info!("embedded hub stopped");
     }
+    state.embedded_hub_cfg = None;
+    state.embedded_hub_addr = None;
     state.hub_stats = None;
     if let Some(p) = state.hub_stats_poller.take() {
         p.abort();
@@ -1554,6 +1612,8 @@ mod tests {
             transfer_clear_at: Vec::new(),
             embedded_hub: None,
             embedded_hub_gen: 0,
+            embedded_hub_cfg: None,
+            embedded_hub_addr: None,
             hub_bind_error: None,
             hub_stats: None,
             hub_stats_poller: None,
@@ -1786,7 +1846,7 @@ mod tests {
         let live_gen = state.supervisor_gen;
         assert!(is_live_supervisor_event(&state, live_gen));
 
-        abort_running(&mut state);
+        abort_running(&mut state, false);
 
         assert!(
             !is_live_supervisor_event(&state, live_gen),
@@ -1835,7 +1895,7 @@ mod tests {
         ));
         assert_eq!(state.transfers.len(), 2);
 
-        abort_running(&mut state);
+        abort_running(&mut state, false);
         assert!(state.transfers.is_empty());
         assert!(state.transfer_clear_at.is_empty());
         assert!(state.next_transfer_deadline().is_none());
@@ -2044,5 +2104,82 @@ mod tests {
         let header = format_transfer_header(&[progress("bad.bin", ProgressState::Failed, 0, 100)]);
         assert_eq!(header, "Transfers (1 failed)");
         assert!(!header.contains("done"), "{header}");
+    }
+
+    /// Write a client config file with the given `[hub]` section verbatim.
+    /// `ClientConfig::load` enforces 0600 on unix, so the test file has to
+    /// match or the load fails for the wrong reason.
+    fn write_hub_config(dir: &Path, hub_section: &str) -> PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "server = \"wss://127.0.0.1:8484/sync\"\nuser = \"u\"\npassword = \"p\"\n\n{hub_section}"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn reload_keeps_the_hub_only_when_its_section_is_unchanged() {
+        // The "every save drops every peer" regression: `abort_running` used
+        // to kill the listener unconditionally, so a settings save that
+        // changed nothing still closed all connected clients.
+        let rt = tokio::runtime::Runtime::new().expect("test runtime");
+        let hub_task = rt.handle().spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let mut state = empty_state();
+        state.embedded_hub = Some(hub_task);
+        state.embedded_hub_cfg = Some(clipboardwire_core::client::config::HubConfig {
+            enabled: true,
+            user: "u".into(),
+            password: "p".into(),
+            ..Default::default()
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "cw-tray-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Identical [hub] section → the running hub stays up.
+        let same = write_hub_config(
+            &dir,
+            "[hub]\nenabled = true\nbind = \"0.0.0.0:8484\"\nuser = \"u\"\npassword = \"p\"",
+        );
+        assert!(
+            hub_restart_unneeded(&state, &same),
+            "an unchanged [hub] section must not trigger a rebind"
+        );
+
+        // A different bind → restart.
+        let moved = write_hub_config(
+            &dir,
+            "[hub]\nenabled = true\nbind = \"0.0.0.0:9999\"\nuser = \"u\"\npassword = \"p\"",
+        );
+        assert!(!hub_restart_unneeded(&state, &moved));
+
+        // Same file but the hub task is gone → restart path.
+        state.embedded_hub = None;
+        assert!(!hub_restart_unneeded(&state, &same));
+
+        // A file that does not parse → restart path.
+        let gone = dir.join("missing.toml");
+        assert!(!hub_restart_unneeded(&state, &gone));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

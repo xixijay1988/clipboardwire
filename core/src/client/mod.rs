@@ -615,6 +615,76 @@ fn restart_receive(
     );
 }
 
+/// Verify a fully-received lazy transfer, move it to the save dir, and queue
+/// it for the clipboard batch window.
+///
+/// Reached from two places that mean the same thing — "every byte is here and
+/// so is the digest": a `file_digest` landing after the last chunk, or the
+/// last chunk landing after an early digest. Whichever order the wire chose,
+/// the completion path is identical.
+#[allow(clippy::too_many_arguments)]
+fn finish_ready_transfer(
+    receives: &mut receive::ReceiveEngine,
+    assembler: &mut Option<receive::LazyAssembler>,
+    pending_files: &mut Vec<std::path::PathBuf>,
+    pending_deadline: &mut Option<tokio::time::Instant>,
+    resolved_save_dir: &Option<std::path::PathBuf>,
+    log_file_names: bool,
+    transfer_id: Uuid,
+    sha256: String,
+) {
+    let Some(assembler) = assembler.as_mut() else {
+        // Unreachable in practice: `assembler` is built from
+        // `resolved_save_dir`, which is only `None` when the platform cannot
+        // report a home directory — and that case was already logged at ERROR
+        // before this loop started. Kept as a hard error rather than a warning
+        // because reaching it means a completed file is about to be thrown
+        // away, which is exactly the failure users report as "nothing
+        // happens".
+        error!(
+            %transfer_id,
+            "digest arrived but no directory is configured for received files; \
+             discarding a completed transfer"
+        );
+        receives.finish(&transfer_id);
+        return;
+    };
+    let Some(session) = receives.session(&transfer_id) else {
+        return;
+    };
+    // The same directory the partial file was assembled under. This used to
+    // read `receive_policy.save_dir`, which `ReceivePolicy::from_config`
+    // always leaves `None` — so every file that survived the earlier bug
+    // landed in the temp directory instead of the user's Downloads folder.
+    let (file_id, name, save_dir) = (
+        session.file_id,
+        session.name.clone(),
+        resolved_save_dir.clone().unwrap_or_else(std::env::temp_dir),
+    );
+    let Some(partial) = assembler.take(&file_id) else {
+        warn!(file = %crate::logging::redact_file_name(&name, log_file_names),
+              "transfer completed with no partial file; dropping");
+        receives.finish(&transfer_id);
+        return;
+    };
+    receives.finish(&transfer_id);
+    match file::finish_lazy_transfer(&partial, &save_dir, &name, &sha256) {
+        Ok(path) => {
+            tracing::info!(
+                file = %crate::logging::redact_path(&path, log_file_names),
+                "saved received file"
+            );
+            pending_files.push(path);
+            *pending_deadline = Some(tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW);
+        }
+        Err(e) => warn!(
+            file = %crate::logging::redact_file_name(&name, log_file_names),
+            error = %format!("{e:#}"),
+            "lazy transfer failed verification"
+        ),
+    }
+}
+
 /// Bridge clipboard events ↔ transport frames. Public for the integration
 /// tests, which inject test-controlled [`Clipboard`] and [`Transport`] handles
 /// without spawning the real arboard thread or hitting the network.
@@ -975,6 +1045,30 @@ pub async fn run_supervisor_with_policy(
                                 );
                             }
                         }
+                        receive::ChunkOutcome::Ready { sha256 } => {
+                            // The last chunk landed after the digest had
+                            // already been stored — identical completion to
+                            // the digest-arriving-last path, except this
+                            // chunk's bytes still have to be written first.
+                            if let Some(transfer_id) = chunk.transfer_id {
+                                if let Some(assembler) = assembler.as_mut() {
+                                    if let Err(e) = assembler.write(&chunk) {
+                                        warn!(error = %e, "could not write a pulled chunk");
+                                        continue;
+                                    }
+                                }
+                                finish_ready_transfer(
+                                    &mut receives,
+                                    &mut assembler,
+                                    &mut pending_files,
+                                    &mut pending_deadline,
+                                    &resolved_save_dir,
+                                    log_file_names,
+                                    transfer_id,
+                                    sha256,
+                                );
+                            }
+                        }
                         receive::ChunkOutcome::Ignored => {}
                         receive::ChunkOutcome::Restart => {
                             // The engine already dropped the broken session, so
@@ -1164,82 +1258,21 @@ pub async fn run_supervisor_with_policy(
                     Frame::FileDigest(digest) => {
                         match receives.handle_digest(&digest, now_millis()) {
                             receive::DigestOutcome::Ready { sha256 } => {
-                                let Some(assembler) = assembler.as_mut() else {
-                                    // Unreachable in practice: `assembler` is
-                                    // built from `resolved_save_dir`, which is
-                                    // only `None` when the platform cannot
-                                    // report a home directory — and that case
-                                    // was already logged at ERROR before this
-                                    // loop started. Kept as a hard error rather
-                                    // than a warning because reaching it means
-                                    // a completed file is about to be thrown
-                                    // away, which is exactly the failure users
-                                    // report as "nothing happens".
-                                    error!(
-                                        %digest.transfer_id,
-                                        "digest arrived but no directory is configured for \
-                                         received files; discarding a completed transfer"
-                                    );
-                                    receives.finish(&digest.transfer_id);
-                                    continue;
-                                };
-                                let Some(session) = receives.session(&digest.transfer_id) else {
-                                    continue;
-                                };
-                                // The same directory the partial file was
-                                // assembled under. This used to read
-                                // `receive_policy.save_dir`, which
-                                // `ReceivePolicy::from_config` always leaves
-                                // `None` — so every file that survived the
-                                // earlier bug landed in the temp directory
-                                // instead of the user's Downloads folder.
-                                let (file_id, name, save_dir) = (
-                                    session.file_id,
-                                    session.name.clone(),
-                                    resolved_save_dir
-                                        .clone()
-                                        .unwrap_or_else(std::env::temp_dir),
-                                );
-                                let Some(partial) = assembler.take(&file_id) else {
-                                    warn!(file = %crate::logging::redact_file_name(&name, log_file_names),
-                                           "digest arrived with no partial file; dropping");
-                                    receives.finish(&digest.transfer_id);
-                                    continue;
-                                };
-                                receives.finish(&digest.transfer_id);
-                                match file::finish_lazy_transfer(&partial, &save_dir, &name, &sha256)
-                                {
-                                    Ok(path) => {
-                                        tracing::info!(
-                                            file = %crate::logging::redact_path(&path, log_file_names),
-                                            "saved received file"
-                                        );
-                                        pending_files.push(path);
-                                        pending_deadline = Some(
-                                            tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW,
-                                        );
-                                    }
-                                    Err(e) => warn!(
-                                        file = %crate::logging::redact_file_name(&name, log_file_names),
-                                        error = %format!("{e:#}"),
-                                        "lazy transfer failed verification"
-                                    ),
-                                }
-                            }
-                            receive::DigestOutcome::Incomplete => {
-                                warn!(
-                                    %digest.transfer_id,
-                                    restarts = receives.restarts_used(&digest.file_id),
-                                    "digest arrived before every chunk; restarting"
-                                );
-                                restart_receive(
+                                finish_ready_transfer(
                                     &mut receives,
                                     &mut assembler,
-                                    &transport,
-                                    &digest.file_id,
-                                    None,
-                                    receive_policy.pull_window_chunks,
+                                    &mut pending_files,
+                                    &mut pending_deadline,
+                                    &resolved_save_dir,
                                     log_file_names,
+                                    digest.transfer_id,
+                                    sha256,
+                                );
+                            }
+                            receive::DigestOutcome::Early => {
+                                debug!(
+                                    %digest.transfer_id,
+                                    "digest overtook the tail chunks; stored, still pulling"
                                 );
                             }
                             receive::DigestOutcome::Unknown => {
