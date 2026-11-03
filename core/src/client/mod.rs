@@ -8,6 +8,7 @@ pub mod config;
 pub mod file;
 pub mod files_clipboard;
 pub mod offer;
+pub mod paste;
 pub mod pull;
 pub mod receive;
 pub mod tls;
@@ -414,8 +415,17 @@ impl ReceivePolicy {
     }
 
     /// `receive_mode` after `auto` has been resolved for this platform.
+    ///
+    /// `paste` only resolves on Windows, the one platform with a clipboard
+    /// that can render a file on demand (OLE delayed rendering). Everywhere
+    /// else it degrades to `pickup`: Linux rejects the config up front and on
+    /// macOS Finder cannot invoke a file-promise provider on Cmd+V — there is
+    /// no paste-time hook to hang a pull on.
     pub fn resolved_mode(&self) -> ReceiveMode {
-        self.mode.resolved()
+        match self.mode.resolved() {
+            ReceiveMode::Paste if !cfg!(windows) => ReceiveMode::Pickup,
+            m => m,
+        }
     }
 }
 
@@ -554,6 +564,7 @@ fn restart_receive(
     seed: Option<receive::ReceiveSession>,
     window: u32,
     log_file_names: bool,
+    paste_sink: &mut PasteSink,
 ) {
     let Some(shape) = receives.shape(file_id).cloned() else {
         // Without the offer's shape a restart cannot be built: the failed
@@ -562,6 +573,7 @@ fn restart_receive(
         if let Some(assembler) = assembler.as_mut() {
             assembler.discard(file_id);
         }
+        paste_sink.fail(file_id, "offer no longer available");
         return;
     };
     // The engine counts its own restarts (a hole in the stream, a digest
@@ -579,6 +591,7 @@ fn restart_receive(
         if let Some(assembler) = assembler.as_mut() {
             assembler.discard(file_id);
         }
+        paste_sink.fail(file_id, "pull failed after too many retries");
         return;
     }
     let _ = window;
@@ -629,6 +642,7 @@ fn finish_ready_transfer(
     pending_files: &mut Vec<std::path::PathBuf>,
     pending_deadline: &mut Option<tokio::time::Instant>,
     resolved_save_dir: &Option<std::path::PathBuf>,
+    paste_sink: &mut PasteSink,
     log_file_names: bool,
     transfer_id: Uuid,
     sha256: String,
@@ -647,6 +661,10 @@ fn finish_ready_transfer(
              discarding a completed transfer"
         );
         receives.finish(&transfer_id);
+        if let Some(session) = receives.session(&transfer_id) {
+            let fid = session.file_id;
+            paste_sink.fail(&fid, "no directory configured for received files");
+        }
         return;
     };
     let Some(session) = receives.session(&transfer_id) else {
@@ -656,15 +674,23 @@ fn finish_ready_transfer(
     // read `receive_policy.save_dir`, which `ReceivePolicy::from_config`
     // always leaves `None` — so every file that survived the earlier bug
     // landed in the temp directory instead of the user's Downloads folder.
+    // A paste render wants the verified file in the invisible spool, not in
+    // Downloads — the paste target is its real destination.
+    let paste_render = paste_sink.waiters.contains_key(&session.file_id);
     let (file_id, name, save_dir) = (
         session.file_id,
         session.name.clone(),
-        resolved_save_dir.clone().unwrap_or_else(std::env::temp_dir),
+        if paste_render {
+            paste_sink.spool_dir.clone()
+        } else {
+            resolved_save_dir.clone().unwrap_or_else(std::env::temp_dir)
+        },
     );
     let Some(partial) = assembler.take(&file_id) else {
         warn!(file = %crate::logging::redact_file_name(&name, log_file_names),
               "transfer completed with no partial file; dropping");
         receives.finish(&transfer_id);
+        paste_sink.fail(&file_id, "transfer completed with no data");
         return;
     };
     receives.finish(&transfer_id);
@@ -674,14 +700,24 @@ fn finish_ready_transfer(
                 file = %crate::logging::redact_path(&path, log_file_names),
                 "saved received file"
             );
-            pending_files.push(path);
-            *pending_deadline = Some(tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW);
+            if let Some(ws) = paste_sink.waiters.remove(&file_id) {
+                paste_sink.ready.insert(file_id, path.clone());
+                for w in ws {
+                    let _ = w.try_send(Ok(path.clone()));
+                }
+            } else {
+                pending_files.push(path);
+                *pending_deadline = Some(tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW);
+            }
         }
-        Err(e) => warn!(
-            file = %crate::logging::redact_file_name(&name, log_file_names),
-            error = %format!("{e:#}"),
-            "lazy transfer failed verification"
-        ),
+        Err(e) => {
+            warn!(
+                file = %crate::logging::redact_file_name(&name, log_file_names),
+                error = %format!("{e:#}"),
+                "lazy transfer failed verification"
+            );
+            paste_sink.fail(&file_id, "transfer failed verification");
+        }
     }
 }
 
@@ -837,8 +873,34 @@ pub async fn run_supervisor_with_policy(
     // and keeps the resolution well inside the slack either timer tolerates.
     let mut receive_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     receive_tick.tick().await; // skip the immediate first tick
-                               // Same directory as the eager receiver above — see `resolved_save_dir`.
-    let mut assembler = resolved_save_dir.clone().map(receive::LazyAssembler::new);
+                               // In `paste` mode the assembler only ever services paste pulls (nothing
+                               // else auto-pulls), so its whole working directory is the invisible spool
+                               // — partials for paste renders must never appear in Downloads.
+    let mut assembler = if matches!(receive_policy.resolved_mode(), ReceiveMode::Paste) {
+        Some(receive::LazyAssembler::new(paste::spool_dir()))
+    } else {
+        resolved_save_dir.clone().map(receive::LazyAssembler::new)
+    };
+
+    // `paste` mode (Windows): offers arm an OLE delayed-render promise; the
+    // pull only runs when a paste target asks for FileContents. `resolved_mode`
+    // already maps `paste` to `pickup` on non-Windows builds, so the channel
+    // here is only ever Some on Windows.
+    let (paste_source, mut paste_events) =
+        if matches!(receive_policy.resolved_mode(), ReceiveMode::Paste) {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (Some(paste::spawn(tx)), Some(rx))
+        } else {
+            (None, None)
+        };
+    let mut paste_sink = PasteSink {
+        spool_dir: paste::spool_dir(),
+        ..PasteSink::default()
+    };
+    let _ = std::fs::create_dir_all(&paste_sink.spool_dir);
+    // Offers collected while `promise_deadline` runs; armed as one batch.
+    let mut promise_files: Vec<paste::PromiseFile> = Vec::new();
+    let mut promise_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         // Snapshot for the async closure to avoid borrowing
@@ -852,6 +914,21 @@ pub async fn run_supervisor_with_policy(
             }
         };
         tokio::pin!(deadline_fut);
+        let current_promise_deadline = promise_deadline;
+        let promise_fut = async move {
+            match current_promise_deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(promise_fut);
+        let paste_ev_fut = async {
+            match paste_events.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<paste::PasteEvent>>().await,
+            }
+        };
+        tokio::pin!(paste_ev_fut);
         tokio::select! {
             local = clipboard.events_rx.recv() => {
                 let Some(change) = local else {
@@ -1063,6 +1140,7 @@ pub async fn run_supervisor_with_policy(
                                     &mut pending_files,
                                     &mut pending_deadline,
                                     &resolved_save_dir,
+                                    &mut paste_sink,
                                     log_file_names,
                                     transfer_id,
                                     sha256,
@@ -1092,6 +1170,7 @@ pub async fn run_supervisor_with_policy(
                                     None,
                                     receive_policy.pull_window_chunks,
                                     log_file_names,
+                                    &mut paste_sink,
                                 );
                             }
                         }
@@ -1105,6 +1184,7 @@ pub async fn run_supervisor_with_policy(
                             if let Some(assembler) = assembler.as_mut() {
                                 assembler.discard(&chunk.file_id);
                             }
+                            paste_sink.fail(&chunk.file_id, "pull failed");
                         }
                     }
                     continue;
@@ -1204,15 +1284,42 @@ pub async fn run_supervisor_with_policy(
                             debug!(file_id = %offer.file_id, file = %name,
                                    "ignoring offer; this build advertises no lazy capability");
                         } else if !receive_policy.pulls_offers_automatically() {
-                            // `eager`/`paste`: we *can* pull, but this is not a
-                            // "pull on arrival" mode. The tray will offer it
-                            // (5.11); until then the offer is only logged.
-                            debug!(
-                                file_id = %offer.file_id,
-                                file = %name,
-                                mode = ?receive_policy.resolved_mode(),
-                                "offer noted; mode does not pull automatically"
-                            );
+                            if matches!(receive_policy.resolved_mode(), ReceiveMode::Paste) {
+                                // `paste`: the offer becomes a clipboard
+                                // promise. The shape is registered now so the
+                                // pull can start the moment a paste target
+                                // asks — which may be minutes or never.
+                                let Some(device) = offer.from_device else {
+                                    warn!(file_id = %offer.file_id,
+                                          "offer without from_device; cannot promise it");
+                                    continue;
+                                };
+                                if receives.shape(&offer.file_id).is_none() {
+                                    receives.note_shape(
+                                        offer.file_id,
+                                        receive::ReceiveEngine::shape_from_offer(&offer, device),
+                                    );
+                                }
+                                if !promise_files.iter().any(|f| f.file_id == offer.file_id) {
+                                    promise_files.push(paste::PromiseFile {
+                                        file_id: offer.file_id,
+                                        name: offer.name.clone(),
+                                        size: offer.file_size,
+                                    });
+                                }
+                                promise_deadline = Some(
+                                    tokio::time::Instant::now() + PROMISE_BATCH_WINDOW,
+                                );
+                            } else {
+                                // `eager`: we *can* pull, but this is not a
+                                // "pull on arrival" mode.
+                                debug!(
+                                    file_id = %offer.file_id,
+                                    file = %name,
+                                    mode = ?receive_policy.resolved_mode(),
+                                    "offer noted; mode does not pull automatically"
+                                );
+                            }
                         } else if receives.has_session_for(&offer.file_id)
                             || receives.shape(&offer.file_id).is_some()
                         {
@@ -1264,6 +1371,7 @@ pub async fn run_supervisor_with_policy(
                                     &mut pending_files,
                                     &mut pending_deadline,
                                     &resolved_save_dir,
+                                    &mut paste_sink,
                                     log_file_names,
                                     digest.transfer_id,
                                     sha256,
@@ -1310,6 +1418,7 @@ pub async fn run_supervisor_with_policy(
                                 if let Some(assembler) = assembler.as_mut() {
                                     assembler.discard(&abort.file_id);
                                 }
+                                paste_sink.fail(&abort.file_id, "offer was withdrawn");
                                 if dropped > 0 {
                                     debug!(
                                         file_id = %abort.file_id,
@@ -1332,6 +1441,49 @@ pub async fn run_supervisor_with_policy(
                     }
                 }
             }
+            ev = &mut paste_ev_fut => {
+                let Some(paste::PasteEvent::Pull { file_id, reply }) = ev else {
+                    continue;
+                };
+                // A verified spool survives the first render — a second paste
+                // of the same file must not pull the bytes again.
+                if let Some(path) = paste_sink.ready.get(&file_id) {
+                    let _ = reply.try_send(Ok(path.clone()));
+                    continue;
+                }
+                paste_sink.waiters.entry(file_id).or_default().push(reply);
+                if !receives.has_session_for(&file_id) {
+                    match receives.shape(&file_id).cloned() {
+                        Some(shape) => {
+                            let transfer_id =
+                                receives.open(file_id, shape.clone(), now_millis());
+                            info!(
+                                file_id = %file_id,
+                                %transfer_id,
+                                "paste requested the file; pulling"
+                            );
+                            request_next_window(
+                                &mut receives,
+                                &transport.outbound_control_tx,
+                                &transfer_id,
+                                Some(shape.from_device),
+                            );
+                        }
+                        None => {
+                            // The offer expired before the paste; the promise
+                            // outlived what the source will serve.
+                            paste_sink.fail(&file_id, "offer expired or source offline");
+                        }
+                    }
+                }
+            }
+            _ = &mut promise_fut, if promise_deadline.is_some() => {
+                promise_deadline = None;
+                let files = std::mem::take(&mut promise_files);
+                if let Some(source) = paste_source.as_ref() {
+                    source.arm(files);
+                }
+            }
             _ = receive_tick.tick() => {
                 let now = now_millis();
                 // Aborted sessions restart here, one tick after the abort:
@@ -1348,6 +1500,7 @@ pub async fn run_supervisor_with_policy(
                         Some(old),
                         receive_policy.pull_window_chunks,
                         log_file_names,
+                        &mut paste_sink,
                     );
                 }
                 for (transfer_id, reason) in receives.stale(now) {
@@ -1367,6 +1520,7 @@ pub async fn run_supervisor_with_policy(
                                     Some(old),
                                     receive_policy.pull_window_chunks,
                                     log_file_names,
+                                    &mut paste_sink,
                                 );
                             }
                         }
@@ -1433,6 +1587,38 @@ pub async fn run_supervisor_with_policy(
 /// single-file `Ctrl+C` (~paste latency) while reliably collapsing a
 /// multi-file `Ctrl+C` into one clipboard set even on slow networks.
 const RECEIVE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Offers of one copy action reach the promise arm in the same poll bursts;
+/// 400 ms folds a multi-file copy into a single `FILEGROUPDESCRIPTORW`.
+const PROMISE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// State for `receive_mode = "paste"` renders in flight.
+///
+/// A paste target's `GetData` blocks on a channel until its file is spooled
+/// and verified; `waiters` holds those replies per `file_id`. `ready` is the
+/// completed spool — a second paste of the same file serves the verified file
+/// straight from disk instead of pulling again.
+#[derive(Default)]
+struct PasteSink {
+    waiters: std::collections::HashMap<
+        Uuid,
+        Vec<std::sync::mpsc::SyncSender<Result<std::path::PathBuf, String>>>,
+    >,
+    ready: std::collections::HashMap<Uuid, std::path::PathBuf>,
+    spool_dir: std::path::PathBuf,
+}
+
+impl PasteSink {
+    /// Fail every blocked `GetData` for `file_id` — Explorer then reports
+    /// "cannot paste" instead of waiting forever.
+    fn fail(&mut self, file_id: &Uuid, reason: &str) {
+        if let Some(ws) = self.waiters.remove(file_id) {
+            for w in ws {
+                let _ = w.try_send(Err(reason.to_string()));
+            }
+        }
+    }
+}
 
 /// `tokio::select!` wants every arm to be a future. When the supervisor
 /// is configured *without* inbound files (the headless `send`

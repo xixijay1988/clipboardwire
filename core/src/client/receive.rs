@@ -187,6 +187,13 @@ impl ReceiveEngine {
         transfer_id
     }
 
+    /// Register an offer's shape without opening a session — `paste` mode
+    /// needs the shape on hand for the moment a paste target asks for the
+    /// bytes, which can be long after the offer arrived.
+    pub fn note_shape(&mut self, file_id: Uuid, shape: OfferShape) {
+        self.shapes.insert(file_id, shape);
+    }
+
     /// Build an [`OfferShape`] from a wire offer.
     ///
     /// `total_chunks` is derived from `file_size` because an offer carries no
