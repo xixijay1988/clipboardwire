@@ -152,5 +152,45 @@
     "build": "dist/lazy5 (mac aarch64 + windows exe)",
     "local": "lazy5 installed, PID 17122, connected",
     "test": "XS-OFFICE: deploy lazy5, receive_mode=paste, watch for promise arm + pull-on-paste"
-  }
+  },
+  "lazy6_polish": {
+    "commits": [
+      "54c7cba (frames overflow + version menu)",
+      "f453b93 (docs)"
+    ],
+    "build": "dist/lazy6 both platforms; mac installed PID 44018",
+    "pending_operation": "cw-xs-office-lazy6-deploy",
+    "verify": "exe deployed, paste config kept, version string in binary, no routed-frame warnings under load",
+    "remaining": [
+      "IDataObjectAsyncCapability/IAsyncOperation progress UI (v2, larger)",
+      "hub_caps empty-window eager downgrade (minor)",
+      "close frame before unbind on Quit (polish)"
+    ]
+  },
+  "lazy7_build_stamp": {
+    "commit": "2aa5076",
+    "build": "dist/lazy7, tag=lazy7 sha=2aa5076-dirty baked in; mac installed PID 60140",
+    "pending_operation": "cw-xs-office-lazy7-deploy"
+  },
+  "lazy7_result": "DEPLOYED BY USER self-paste into Program Files; PID 44268; zero routed-frame warnings; ~8 live pulls",
+  "lazy9_async": {
+    "commit": "c3b5466 IDataObjectAsyncCapability",
+    "also_includes": "3d02290 menu blank-row fix",
+    "build": "dist/lazy9 + ole-spike2.exe probe (QI check); mac installed PID 84721",
+    "pending_operation": "cw-xs-office-lazy9-deploy",
+    "verify": "probe prints IDataObjectAsyncCapability: present; real Explorer paste shows progress dialog"
+  },
+  "lazy9_result": "DEPLOYED by user (PID 51808), stamp lazy9-c3b5466-dirty; async-cap verify was FALSE NEGATIVE — probe binary lacked the check",
+  "async_verify": {
+    "pending_operation": "cw-xs-office-async-verify-r2",
+    "probe": "ole-spike3.exe fixed (1,785,151B)",
+    "verify": "probe prints present/ABSENT line on next promise",
+    "note": "first ole-spike3 send lost — mac client was dead; re-sent 09:19Z with PID 22478 alive",
+    "result": "VERIFIED: IDataObjectAsyncCapability present, async_mode=BOOL(1) on lazy9 promise (probe 17:40:21, race won by 600ms sniper)"
+  },
+  "feature_status": "all items done: paste mode, invisible spool, version stamp, blank-row fix, hub overflow, async capability",
+  "polish_remaining": [
+    "send close frame before unbind on Quit",
+    "hub_caps empty-window eager downgrade"
+  ]
 }
