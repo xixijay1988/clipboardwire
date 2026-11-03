@@ -367,12 +367,10 @@ pub fn run(
     );
     let quit_item = MenuItem::new("Quit clipboardwire", true, None);
     // Version is informational like the status lines — disabled, bottom of
-    // the menu where users look for "About" on every platform.
-    let version_item = MenuItem::new(
-        format!("clipboardwire v{}", env!("CARGO_PKG_VERSION")),
-        false,
-        None,
-    );
+    // the menu where users look for "About" on every platform. The label
+    // carries the build stamp (`v0.5.4-lazy7+g54c7cba`) so test builds are
+    // distinguishable, which a bare `v0.5.4` could never do.
+    let version_item = MenuItem::new(version_label(), false, None);
     menu.append(&status_item)?;
     menu.append(&server_item)?;
     menu.append(&hub_info_item)?;
@@ -1100,6 +1098,20 @@ fn refresh_icon(tray: &TrayIcon, theme: Option<dark_light::Mode>, state: &State)
 
 /// Render the user-facing status label. Kept short + prefix-stable so
 /// the menu doesn't reflow on every status change.
+/// Build stamp shown in the tray menu: `v{ver}[-tag]+g{sha}`.
+/// `tag` exists only when the package was built with
+/// `CLIPBOARDWIRE_BUILD_TAG` set; `sha` always does.
+fn version_label() -> String {
+    let tag = option_env!("CW_BUILD_TAG")
+        .map(|t| format!("-{t}"))
+        .unwrap_or_default();
+    format!(
+        "clipboardwire v{}{tag}+g{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CW_GIT_SHA").unwrap_or("dev")
+    )
+}
+
 fn status_label_for(status: Option<ClientStatus>, has_cfg: bool) -> String {
     status_label_with_hub(status, has_cfg, None)
 }
