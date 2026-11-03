@@ -228,7 +228,7 @@ struct MockWire {
     _inbound_tx: mpsc::Sender<ClipFrame>,
     _outbound_rx: mpsc::Receiver<ClipFrame>,
     _outbound_files_rx: mpsc::Receiver<FileChunkFrame>,
-    _hub_caps_tx: watch::Sender<Caps>,
+    _hub_caps_tx: watch::Sender<Option<Caps>>,
     inbound_control_tx: mpsc::Sender<Frame>,
     inbound_files_tx: mpsc::Sender<FileChunkFrame>,
     outbound_control_rx: mpsc::Receiver<Frame>,
@@ -244,7 +244,7 @@ fn mock_supervisor(recv_dir: PathBuf) -> (MockWire, tokio::task::JoinHandle<()>)
     let (inbound_tx, inbound_rx) = mpsc::channel::<ClipFrame>(8);
     let (inbound_control_tx, inbound_control_rx) = mpsc::channel::<Frame>(8);
     let (inbound_files_tx, inbound_files_rx) = mpsc::channel::<FileChunkFrame>(8);
-    let (hub_caps_tx, hub_caps) = watch::channel(Caps::LAZY_FILE);
+    let (hub_caps_tx, hub_caps) = watch::channel(Some(Caps::LAZY_FILE));
 
     let transport = Transport {
         inbound_rx,

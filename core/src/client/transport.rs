@@ -100,7 +100,7 @@ pub struct Transport {
     /// supervisor's loop runs across every reconnect. The supervisor reads this
     /// per copy rather than caching it, so it always gates on the connection
     /// that is actually live.
-    pub hub_caps: watch::Receiver<Caps>,
+    pub hub_caps: watch::Receiver<Option<Caps>>,
 }
 
 impl Transport {
@@ -222,7 +222,7 @@ pub fn spawn_with_options(
     // Starts empty, which is the correct answer while no welcome has arrived:
     // a sender that copies a file before the handshake completes must not
     // assume the hub understands offers.
-    let (hub_caps_tx, hub_caps_rx) = watch::channel(Caps::default());
+    let (hub_caps_tx, hub_caps_rx) = watch::channel(None);
     let SpawnOptions {
         status_tx,
         one_shot,
@@ -292,7 +292,7 @@ async fn run_loop(
     wire: WireOptions,
     mut links: Links,
     status_tx: Option<watch::Sender<ClientStatus>>,
-    hub_caps_tx: watch::Sender<Caps>,
+    hub_caps_tx: watch::Sender<Option<Caps>>,
     one_shot: bool,
 ) {
     let emit = |s: ClientStatus| {
@@ -397,6 +397,14 @@ where
             break;
         }
     }
+
+    // Say goodbye on the wire. A plain `sink` drop tears the TCP connection
+    // down without a WebSocket close frame — and on wss, without the TLS
+    // `close_notify` either, which is exactly the "peer closed connection
+    // without close_notify" warning peers logged on every Quit. `Sink::close`
+    // sends the Close frame and shuts the underlying stream down politely;
+    // the timeout keeps a hung peer from turning Quit into a hang.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sink.close()).await;
     Ok(())
 }
 
@@ -476,7 +484,7 @@ async fn connect_and_serve(
     wire: WireOptions,
     links: &mut Links,
     status_tx: Option<&watch::Sender<ClientStatus>>,
-    hub_caps_tx: &watch::Sender<Caps>,
+    hub_caps_tx: &watch::Sender<Option<Caps>>,
 ) -> Result<()> {
     let url = upgrade_url(&config.server, wire.device, wire.caps);
     let mut req = url
@@ -522,7 +530,7 @@ async fn connect_and_serve(
     // hub actually understanding offers. Published per connection: a reconnect
     // may reach a hub that advertises something else, and the supervisor must
     // gate on the live one.
-    let _ = hub_caps_tx.send(hub_caps);
+    let _ = hub_caps_tx.send(Some(hub_caps));
     debug!(
         server = %welcome.server,
         client_id = %welcome.client_id,

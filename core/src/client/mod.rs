@@ -956,7 +956,21 @@ pub async fn run_supervisor_with_policy(
                     // turns "the user configured lazy against a v0.3 hub" from a
                     // silent no-op into a working transfer.
                     ClipChange::Files(paths) => {
-                        let hub_caps = *transport.hub_caps.borrow();
+                        let mut hub_caps = *transport.hub_caps.borrow();
+                        if hub_caps.is_none() && send_policy.mode == SendMode::Lazy {
+                            // No welcome yet: an empty `Caps` means "v0.3
+                            // hub", not "still connecting" — waiting a beat
+                            // for the verdict avoids a spurious eager
+                            // downgrade the moment after connect.
+                            let mut rx = transport.hub_caps.clone();
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                rx.changed(),
+                            )
+                            .await;
+                            hub_caps = *transport.hub_caps.borrow();
+                        }
+                        let hub_caps = hub_caps.unwrap_or_default();
                         if send_policy.may_publish_offers(hub_caps) {
                             lazy_downgrade_warned = false;
                             let skipped = publish_offers(
@@ -1912,7 +1926,7 @@ mod tests {
         // The hub must advertise `lazy-file`, or the supervisor is right to
         // refuse to publish an offer this hub could not serve (see
         // `SendPolicy::may_publish_offers`).
-        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Caps::LAZY_FILE);
+        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Some(Caps::LAZY_FILE));
         let transport = Transport {
             inbound_rx,
             inbound_files_rx: None,
@@ -1990,7 +2004,7 @@ mod tests {
             tokio::sync::mpsc::channel::<crate::protocol::FileChunkFrame>(8);
         let (outbound_control_tx, mut outbound_control_rx) = tokio::sync::mpsc::channel::<Frame>(8);
         let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<ClipFrame>(8);
-        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Caps::LAZY_FILE);
+        let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Some(Caps::LAZY_FILE));
 
         let (progress_tx, mut progress_rx) = tokio::sync::broadcast::channel::<TransferProgress>(8);
 
@@ -2126,7 +2140,7 @@ mod tests {
         Transport,
         tokio::sync::mpsc::Receiver<Frame>,
         tokio::sync::mpsc::Receiver<crate::protocol::FileChunkFrame>,
-        tokio::sync::watch::Sender<Caps>,
+        tokio::sync::watch::Sender<Option<Caps>>,
     ) {
         use tokio::sync::mpsc;
         let (outbound_tx, _outbound_rx) = mpsc::channel::<ClipFrame>(8);
@@ -2134,7 +2148,7 @@ mod tests {
             mpsc::channel::<crate::protocol::FileChunkFrame>(8);
         let (outbound_control_tx, outbound_control_rx) = mpsc::channel::<Frame>(8);
         let (inbound_tx, inbound_rx) = mpsc::channel::<ClipFrame>(8);
-        let (hub_caps_tx, hub_caps_rx) = tokio::sync::watch::channel(hub_caps);
+        let (hub_caps_tx, hub_caps_rx) = tokio::sync::watch::channel(Some(hub_caps));
         // Leak both ends of the clip path. A dropped outbound receiver makes
         // the supervisor's `try_send` fail; a dropped inbound *sender* closes
         // `inbound_rx`, which the supervisor reads as "transport gone" and
@@ -2333,7 +2347,7 @@ mod tests {
 
         // The hub is now known to support lazy. The very next copy must take
         // the offer path, without a restart.
-        caps_tx.send(Caps::LAZY_FILE).unwrap();
+        caps_tx.send(Some(Caps::LAZY_FILE)).unwrap();
         events_tx
             .send(ClipChange::Files(vec![path.clone()]))
             .await

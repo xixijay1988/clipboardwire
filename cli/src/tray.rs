@@ -164,6 +164,9 @@ type TransferKey = (TransferId, Option<TransferId>);
 struct State {
     supervisor: Option<JoinHandle<Result<()>>>,
     supervisor_gen: u64,
+    /// Grace deadline after a Quit click: gives the transport a beat to
+    /// flush and send the WebSocket/TLS close before the process exits.
+    quit_at: Option<std::time::Instant>,
     /// Last status reported by the current-generation supervisor.
     /// `None` when no supervisor is running (e.g. needs-config).
     client_status: Option<ClientStatus>,
@@ -390,7 +393,10 @@ pub fn run(
     menu.append(&quit_item)?;
 
     let menu_layout = {
-        let mut order = vec![hub_info_item.id().clone(), transfer_header_item.id().clone()];
+        let mut order = vec![
+            hub_info_item.id().clone(),
+            transfer_header_item.id().clone(),
+        ];
         order.extend(transfer_items.iter().map(|i| i.id().clone()));
         MenuLayout {
             sep_id: sep0.id().clone(),
@@ -459,6 +465,7 @@ pub fn run(
     let mut state = State {
         supervisor: None,
         supervisor_gen: 0,
+        quit_at: None,
         client_status: None,
         transfers: Vec::new(),
         transfer_clear_at: Vec::new(),
@@ -503,7 +510,13 @@ pub fn run(
         // and ordinary events both get the cleanup, and no arm can shadow
         // another by matching here.
         if state.expire_transfers() {
-            update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
+            update_transfer_items(
+                &menu,
+                &menu_layout,
+                &transfer_header_item,
+                &transfer_items,
+                &state,
+            );
             refresh_tooltip(&tray, &state, &config_path);
         }
         // Wait, unless a finished transfer is due to disappear: then wake up at
@@ -513,12 +526,28 @@ pub fn run(
             None => ControlFlow::Wait,
         };
 
+        // Quit grace elapsed — the transport had its beat to close politely.
+        if let Some(at) = state.quit_at {
+            if std::time::Instant::now() >= at {
+                *control_flow = ControlFlow::Exit;
+                return;
+            }
+        }
+
         match event {
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 if menu_event.id == quit_id {
                     info!("Quit menu item clicked");
                     abort_running(&mut state, false);
-                    *control_flow = ControlFlow::Exit;
+                    // Don't exit this instant: `abort_running` drops the
+                    // supervisor's transport senders, which makes the writer
+                    // drain + close politely — but only while the process is
+                    // still alive. Exiting here is what produced the
+                    // "peer closed without close_notify" warning on every
+                    // quit. 600 ms is generous for a close handshake.
+                    state.quit_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+                    *control_flow = ControlFlow::WaitUntil(state.quit_at.unwrap());
                 } else if menu_event.id == edit_id {
                     if state.settings_alive {
                         info!("settings dialog already open; ignoring duplicate Edit click");
@@ -606,7 +635,13 @@ pub fn run(
                 // stale percentages.
                 state.transfers.clear();
                 state.transfer_clear_at.clear();
-                update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
+                update_transfer_items(
+                    &menu,
+                    &menu_layout,
+                    &transfer_header_item,
+                    &transfer_items,
+                    &state,
+                );
                 warn!(
                     gen = generation,
                     summary, "supervisor exited on its own; staying in tray"
@@ -634,7 +669,13 @@ pub fn run(
                 progress,
             }) if is_live_supervisor_event(&state, generation) => {
                 state.record_progress(*progress);
-                update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
+                update_transfer_items(
+                    &menu,
+                    &menu_layout,
+                    &transfer_header_item,
+                    &transfer_items,
+                    &state,
+                );
                 refresh_tooltip(&tray, &state, &config_path);
             }
             Event::UserEvent(UserEvent::ThemeChanged(new_theme)) => {
@@ -1684,6 +1725,7 @@ mod tests {
         State {
             supervisor: None,
             supervisor_gen: 0,
+            quit_at: None,
             client_status: None,
             transfers: Vec::new(),
             transfer_clear_at: Vec::new(),
