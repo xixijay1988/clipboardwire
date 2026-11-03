@@ -366,6 +366,13 @@ pub fn run(
         None,
     );
     let quit_item = MenuItem::new("Quit clipboardwire", true, None);
+    // Version is informational like the status lines — disabled, bottom of
+    // the menu where users look for "About" on every platform.
+    let version_item = MenuItem::new(
+        format!("clipboardwire v{}", env!("CARGO_PKG_VERSION")),
+        false,
+        None,
+    );
     menu.append(&status_item)?;
     menu.append(&server_item)?;
     menu.append(&hub_info_item)?;
@@ -383,6 +390,7 @@ pub fn run(
     menu.append(&sep2)?;
     #[cfg(windows)]
     menu.append(&autostart_item)?;
+    menu.append(&version_item)?;
     menu.append(&quit_item)?;
 
     let edit_id = edit_item.id().clone();

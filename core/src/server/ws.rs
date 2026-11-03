@@ -41,7 +41,7 @@ use super::config::ServerConfig;
 use super::hub::{
     hub_caps, ControlMsg, HubHandle, OfferResult, PullResult, RegisterResult,
     PER_CLIENT_CHANNEL_BUF, PER_CLIENT_CONTROL_CHANNEL_BUF, PER_CLIENT_FILE_CHANNEL_BUF,
-    PER_CLIENT_FILE_OVERFLOW, PER_CLIENT_FRAME_CHANNEL_BUF,
+    PER_CLIENT_FILE_OVERFLOW, PER_CLIENT_FRAME_CHANNEL_BUF, PER_CLIENT_FRAME_OVERFLOW,
 };
 
 /// Application state passed to every request handler.
@@ -529,6 +529,10 @@ async fn handle_socket(
     // chunk channel: different item type, and a close must never queue behind a
     // relayed frame, so `ctl` stays its own lane.
     let (frames_tx, mut frames_rx) = mpsc::channel::<Frame>(PER_CLIENT_FRAME_CHANNEL_BUF);
+    // Same two-level discipline as chunks: an abort lost to a full lane
+    // leaves a zombie session, so routed frames get an overflow lane too.
+    let (frames_overflow_tx, mut frames_overflow_rx) =
+        mpsc::channel::<Frame>(PER_CLIENT_FRAME_OVERFLOW);
     // Control channel: how the hub asks this connection to close. It cannot
     // send a close code itself (no socket, and `Hub::handle` must not await).
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(PER_CLIENT_CONTROL_CHANNEL_BUF);
@@ -543,6 +547,7 @@ async fn handle_socket(
             file_tx,
             overflow_tx,
             frames_tx,
+            frames_overflow_tx,
             ctl_tx,
         )
         .await;
@@ -694,6 +699,20 @@ async fn handle_socket(
                     let json = match serde_json::to_string(&frame) {
                         Ok(s) => s,
                         Err(e) => { error!(error = %e, "serializing routed frame"); continue }
+                    };
+                    if sink.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+
+                // Overflow lane for routed frames. No ordering contract with
+                // `frames_rx` — digests and aborts are advisory and idempotent,
+                // unlike chunks which `ordered_ready` must keep monotonic.
+                maybe_frame = frames_overflow_rx.recv() => {
+                    let Some(frame) = maybe_frame else { break };
+                    let json = match serde_json::to_string(&frame) {
+                        Ok(s) => s,
+                        Err(e) => { error!(error = %e, "serializing overflow routed frame"); continue }
                     };
                     if sink.send(Message::Text(json.into())).await.is_err() {
                         break;
@@ -1150,6 +1169,7 @@ mod tests {
         let (file_tx, _file_rx) = mpsc::channel(1);
         let (overflow_tx, _overflow_rx) = mpsc::channel(1);
         let (frames_tx, _frames_rx) = mpsc::channel(1);
+        let (frames_overflow_tx, _frames_overflow_rx) = mpsc::channel(1);
         let (ctl_tx, _ctl_rx) = mpsc::channel(1);
         hub.register(
             client,
@@ -1159,6 +1179,7 @@ mod tests {
             file_tx,
             overflow_tx,
             frames_tx,
+            frames_overflow_tx,
             ctl_tx,
         )
         .await

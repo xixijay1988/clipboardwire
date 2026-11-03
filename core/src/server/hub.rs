@@ -72,6 +72,12 @@ pub const PER_CLIENT_FILE_OVERFLOW: usize = 8;
 /// at most a handful of aborts, so a small buffer is plenty and a slow peer
 /// cannot balloon memory through it.
 pub const PER_CLIENT_FRAME_CHANNEL_BUF: usize = 8;
+/// Second-level queue for routed frames (`file_digest`, `file_abort`,
+/// `file_offer`, `peer_changed`). Same role as [`PER_CLIENT_FILE_OVERFLOW`]
+/// for chunks: a slow socket bursts control frames just as easily, and an
+/// *abort* that gets dropped leaves a zombie session restarting forever —
+/// the exact congestion loss the XS-OFFICE log showed.
+pub const PER_CLIENT_FRAME_OVERFLOW: usize = 32;
 
 /// Capacity of each connection's control inbox.
 ///
@@ -271,6 +277,8 @@ struct PeerEntry {
     /// `file`, whose item type is `FileChunkFrame` and whose backpressure
     /// behaviour (drop / buffered overflow) is specific to bulk bytes.
     frames: mpsc::Sender<Frame>,
+    /// Second-level queue for `frames`; see [`PER_CLIENT_FRAME_OVERFLOW`].
+    frames_overflow: mpsc::Sender<Frame>,
     /// Close instructions for this connection. Written by [`Hub::evict`];
     /// the connection's writer is the only reader.
     ctl: mpsc::Sender<ControlMsg>,
@@ -291,6 +299,8 @@ pub enum HubMessage {
         /// Second-level queue; same item type as `file_outbound`.
         overflow: mpsc::Sender<FileChunkFrame>,
         frames: mpsc::Sender<Frame>,
+        /// Second-level routed-frame queue; same item type as `frames`.
+        frames_overflow: mpsc::Sender<Frame>,
         ctl: mpsc::Sender<ControlMsg>,
         ack: oneshot::Sender<RegisterResult>,
     },
@@ -400,6 +410,7 @@ impl HubHandle {
         file_outbound: mpsc::Sender<FileChunkFrame>,
         overflow: mpsc::Sender<FileChunkFrame>,
         frames: mpsc::Sender<Frame>,
+        frames_overflow: mpsc::Sender<Frame>,
         ctl: mpsc::Sender<ControlMsg>,
     ) -> anyhow::Result<RegisterResult> {
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -412,6 +423,8 @@ impl HubHandle {
                 file_outbound,
                 overflow,
                 frames,
+
+                frames_overflow,
                 ctl,
                 ack: ack_tx,
             })
@@ -665,6 +678,8 @@ impl Hub {
                 file_outbound,
                 overflow,
                 frames,
+
+                frames_overflow,
                 ctl,
                 ack,
             } => {
@@ -682,6 +697,8 @@ impl Hub {
                         file: file_outbound,
                         overflow,
                         frames,
+
+                        frames_overflow,
                         ctl,
                     },
                 );
@@ -1079,15 +1096,13 @@ impl Hub {
                 );
                 continue;
             }
-            match peer.frames.try_send(frame.clone()) {
-                Ok(()) => delivered += 1,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        client = %peer_id,
-                        "routed-frame buffer full; dropping file_offer"
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            if Self::queue_frame(peer, frame.clone()) {
+                delivered += 1;
+            } else {
+                warn!(
+                    client = %peer_id,
+                    "routed-frame lanes full; dropping file_offer"
+                );
             }
         }
         delivered
@@ -1109,15 +1124,13 @@ impl Hub {
             }
             let mut copy = abort.clone();
             copy.to = Some(peer.device);
-            match peer.frames.try_send(Frame::FileAbort(copy)) {
-                Ok(()) => recipients += 1,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        client = %peer_id,
-                        "routed-frame buffer full; dropping broadcast abort"
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            if Self::queue_frame(peer, Frame::FileAbort(copy)) {
+                recipients += 1;
+            } else {
+                warn!(
+                    client = %peer_id,
+                    "routed-frame lanes full; dropping broadcast abort"
+                );
             }
         }
         DeliveryResult::Broadcast { recipients }
@@ -1206,12 +1219,8 @@ impl Hub {
             if Some(*peer_id) == skip {
                 continue;
             }
-            match peer.frames.try_send(frame.clone()) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(client = %peer_id, "routed-frame buffer full; dropping peer_changed");
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            if !Self::queue_frame(peer, frame.clone()) {
+                warn!(client = %peer_id, "routed-frame lanes full; dropping peer_changed");
             }
         }
     }
@@ -1348,13 +1357,23 @@ impl Hub {
             from_device: chunk.from_device,
             reason: "busy".to_string(),
         };
-        if let Err(e) = peer.frames.try_send(Frame::FileAbort(abort)) {
+        if !Self::queue_frame(peer, Frame::FileAbort(abort)) {
             debug!(
                 %device,
                 %client,
-                error = %e,
                 "could not deliver busy abort; the receiver will time out instead"
             );
+        }
+    }
+
+    /// Queue `frame` on a peer's routed-frame lane — primary, then the
+    /// overflow queue. Returns `true` once it is queued; `false` means every
+    /// lane is full or closed and the caller owns the drop decision.
+    fn queue_frame(peer: &PeerEntry, frame: Frame) -> bool {
+        match peer.frames.try_send(frame.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(f)) => peer.frames_overflow.try_send(f).is_ok(),
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -1370,10 +1389,19 @@ impl Hub {
         };
         match peer.frames.try_send(frame) {
             Ok(()) => DeliveryResult::Delivered,
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(f)) => {
                 // 3.7b: same overflow handling as chunks.
-                warn!(%device, %client, "routed-frame buffer full; dropping frame");
-                DeliveryResult::Busy
+                match peer.frames_overflow.try_send(f) {
+                    Ok(()) => DeliveryResult::Delivered,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(%device, %client, "routed-frame lanes full; dropping frame");
+                        DeliveryResult::Busy
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!(%device, %client, "routed-frame channel closed");
+                        DeliveryResult::UnknownDevice
+                    }
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 debug!(%device, %client, "routed-frame channel closed");
@@ -1677,6 +1705,12 @@ mod tests {
         tx
     }
 
+    /// Closed routed-frame overflow lane — preserves the pre-overflow drop
+    /// semantics tests were written against.
+    fn dummy_frames_overflow_tx() -> mpsc::Sender<Frame> {
+        mpsc::channel(1).0
+    }
+
     /// Control channel for tests that do not exercise eviction.
     fn dummy_ctl_tx() -> mpsc::Sender<ControlMsg> {
         let (tx, _rx) = mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF);
@@ -1713,6 +1747,7 @@ mod tests {
                 file_tx,
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 ctl_tx
             )
             .await
@@ -1744,6 +1779,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx()
             )
             .await
@@ -1765,6 +1801,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -1799,6 +1836,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -1820,6 +1858,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx(),
             )
             .await
@@ -1849,6 +1888,7 @@ mod tests {
                     dummy_file_tx(),
                     dummy_overflow_tx(),
                     dummy_frames_tx(),
+                    dummy_frames_overflow_tx(),
                     dummy_ctl_tx()
                 )
                 .await
@@ -1867,6 +1907,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx(),
             )
             .await
@@ -1891,6 +1932,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -1908,6 +1950,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -1953,6 +1996,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -1969,6 +2013,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx()
             )
             .await
@@ -1990,6 +2035,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx()
             )
             .await
@@ -2015,6 +2061,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -2032,6 +2079,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -2048,6 +2096,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -2080,6 +2129,7 @@ mod tests {
             dummy_file_tx(),
             dummy_overflow_tx(),
             dummy_frames_tx(),
+            dummy_frames_overflow_tx(),
             dummy_ctl_tx(),
         )
         .await
@@ -2102,6 +2152,7 @@ mod tests {
                 dummy_file_tx(),
                 dummy_overflow_tx(),
                 dummy_frames_tx(),
+                dummy_frames_overflow_tx(),
                 dummy_ctl_tx(),
             )
             .await
@@ -2138,6 +2189,8 @@ mod tests {
             file_outbound: file,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         }
@@ -2183,6 +2236,8 @@ mod tests {
             file_outbound: mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF).0,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: ctl_tx,
             ack,
         });
@@ -2203,6 +2258,8 @@ mod tests {
             file_outbound: mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF).0,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: ctl_tx,
             ack,
         });
@@ -2414,6 +2471,8 @@ mod tests {
             file_outbound: file_tx,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -2455,6 +2514,8 @@ mod tests {
             file_outbound: file_tx,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -3112,6 +3173,8 @@ mod tests {
             file_outbound: file_tx,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -3144,6 +3207,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack: ack_tx,
         });
@@ -3185,6 +3250,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack: ack_tx,
         });
@@ -3237,6 +3304,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames: a_frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         });
@@ -3287,6 +3356,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         });
@@ -3344,6 +3415,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         });
@@ -3401,6 +3474,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         });
@@ -3460,6 +3535,8 @@ mod tests {
             file_outbound: file,
             overflow,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl,
             ack,
         });
@@ -3642,6 +3719,70 @@ mod tests {
     }
 
     #[test]
+    fn a_routed_frame_falls_back_to_the_overflow_lane() {
+        // The primary routed-frame lane is deliberately small (8). Before the
+        // overflow lane existed, the 9th frame was dropped on the floor — and
+        // an abort that lands there leaves a receiver restarting a dead
+        // session. Saturate the primary and prove the overflow catches the
+        // next frame instead.
+        let mut hub = hub_direct();
+        hub.now_override = Some(1_000);
+        let source_client = Uuid::new_v4();
+        let source_device = Uuid::new_v4();
+        let source_frames =
+            register_with_caps(&mut hub, source_client, source_device, Caps::LAZY_FILE);
+
+        let busy_client = Uuid::new_v4();
+        let busy_device = Uuid::new_v4();
+        let (b_frames_tx, _b_frames_rx) = mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF);
+        let (b_overflow_tx, mut b_overflow_rx) = mpsc::channel(PER_CLIENT_FRAME_OVERFLOW);
+        let (b_ack, _b_ack_rx) = oneshot::channel();
+        hub.handle(HubMessage::Register {
+            id: busy_client,
+            device: busy_device,
+            caps: Caps::LAZY_FILE,
+            outbound: mpsc::channel(PER_CLIENT_CHANNEL_BUF).0,
+            file_outbound: mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF).0,
+            overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
+            frames: b_frames_tx,
+            frames_overflow: b_overflow_tx,
+            ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
+            ack: b_ack,
+        });
+
+        // Saturate the busy peer's primary lane.
+        for _ in 0..PER_CLIENT_FRAME_CHANNEL_BUF {
+            assert_eq!(
+                publish_offer(
+                    &mut hub,
+                    source_client,
+                    offer_at(Uuid::new_v4(), 1_000 + MINUTE_MS)
+                ),
+                OfferResult::Accepted
+            );
+        }
+        // One more offer must land in the overflow lane, not on the floor.
+        let overflowed = Uuid::new_v4();
+        assert_eq!(
+            publish_offer(
+                &mut hub,
+                source_client,
+                offer_at(overflowed, 1_000 + MINUTE_MS)
+            ),
+            OfferResult::Accepted
+        );
+        match b_overflow_rx
+            .try_recv()
+            .expect("the overflow lane must hold the frame")
+        {
+            Frame::FileOffer(o) => assert_eq!(o.file_id, overflowed),
+            other => panic!("expected a file_offer in overflow, got {other:?}"),
+        }
+        keep_alive(source_frames);
+        keep_alive(_b_frames_rx);
+    }
+
+    #[test]
     fn an_offer_published_through_the_hub_reaches_a_connected_receiver() {
         // The integration-shaped version of (a): driven through `Hub`'s public
         // `publish_offer`/`register` surface rather than by calling internals, so
@@ -3662,6 +3803,8 @@ mod tests {
             file_outbound: mpsc::channel(PER_CLIENT_FILE_CHANNEL_BUF).0,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: mpsc::channel(PER_CLIENT_FRAME_CHANNEL_BUF).0,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -3840,6 +3983,8 @@ mod tests {
             file_outbound: s_file,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: s_frames,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack: s_ack,
         });
@@ -3854,6 +3999,8 @@ mod tests {
             file_outbound: p_file,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: p_frames,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack: p_ack,
         });
@@ -4439,6 +4586,8 @@ mod tests {
             file_outbound: file_tx.clone(),
             overflow: overflow_tx.clone(),
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -4626,6 +4775,8 @@ mod tests {
             file_outbound: file_tx,
             overflow: overflow_tx,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
@@ -4664,6 +4815,8 @@ mod tests {
             file_outbound: file_tx,
             overflow: mpsc::channel(PER_CLIENT_FILE_OVERFLOW).0,
             frames: frames_tx,
+
+            frames_overflow: mpsc::channel(1).0,
             ctl: mpsc::channel(PER_CLIENT_CONTROL_CHANNEL_BUF).0,
             ack,
         });
