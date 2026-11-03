@@ -676,10 +676,11 @@ fn finish_ready_transfer(
     // landed in the temp directory instead of the user's Downloads folder.
     // A paste render wants the verified file in the invisible spool, not in
     // Downloads — the paste target is its real destination.
-    let paste_render = paste_sink.waiters.contains_key(&session.file_id);
-    let (file_id, name, save_dir) = (
+    let paste_render = paste_sink.live.contains_key(&session.file_id);
+    let (file_id, name, file_size, save_dir) = (
         session.file_id,
         session.name.clone(),
+        session.file_size,
         if paste_render {
             paste_sink.spool_dir.clone()
         } else {
@@ -694,21 +695,49 @@ fn finish_ready_transfer(
         return;
     };
     receives.finish(&transfer_id);
+    if paste_render {
+        // Verify in place: the render's readers may hold the partial open
+        // and still be mid-copy, so it cannot be renamed. A pass graduates
+        // it into `ready` for repeat pastes; a fail ends every reader's
+        // stream with an error and the target deletes its half-copied file.
+        match file::sha256_of_path(&partial) {
+            Ok(actual) if actual == sha256 => {
+                tracing::info!(file_id = %file_id, "paste render verified");
+                paste_sink.ready.insert(
+                    file_id,
+                    paste::SpoolStream {
+                        path: partial,
+                        len: file_size,
+                        frontier: paste::SpoolFrontier::completed(),
+                    },
+                );
+                if let Some(f) = paste_sink.live.remove(&file_id) {
+                    f.finish(Ok(()));
+                }
+            }
+            other => {
+                let detail = match &other {
+                    Ok(actual) => format!("expected {sha256}, got {actual}"),
+                    Err(e) => format!("{e:#}"),
+                };
+                warn!(
+                    file = %crate::logging::redact_file_name(&name, log_file_names),
+                    error = %detail,
+                    "lazy transfer failed verification"
+                );
+                paste_sink.fail(&file_id, "transfer failed verification");
+            }
+        }
+        return;
+    }
     match file::finish_lazy_transfer(&partial, &save_dir, &name, &sha256) {
         Ok(path) => {
             tracing::info!(
                 file = %crate::logging::redact_path(&path, log_file_names),
                 "saved received file"
             );
-            if let Some(ws) = paste_sink.waiters.remove(&file_id) {
-                paste_sink.ready.insert(file_id, path.clone());
-                for w in ws {
-                    let _ = w.try_send(Ok(path.clone()));
-                }
-            } else {
-                pending_files.push(path);
-                *pending_deadline = Some(tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW);
-            }
+            pending_files.push(path);
+            *pending_deadline = Some(tokio::time::Instant::now() + RECEIVE_BATCH_WINDOW);
         }
         Err(e) => {
             warn!(
@@ -716,7 +745,6 @@ fn finish_ready_transfer(
                 error = %format!("{e:#}"),
                 "lazy transfer failed verification"
             );
-            paste_sink.fail(&file_id, "transfer failed verification");
         }
     }
 }
@@ -1122,6 +1150,9 @@ pub async fn run_supervisor_with_policy(
                                     continue;
                                 }
                             }
+                            if let Some(transfer_id) = chunk.transfer_id {
+                                paste_sink.advance(&receives, &chunk.file_id, &transfer_id);
+                            }
                             // The window's last chunk has landed, so ask for
                             // the next one.
                             if let Some(transfer_id) = chunk.transfer_id {
@@ -1148,6 +1179,7 @@ pub async fn run_supervisor_with_policy(
                                         continue;
                                     }
                                 }
+                                paste_sink.advance(&receives, &chunk.file_id, &transfer_id);
                                 finish_ready_transfer(
                                     &mut receives,
                                     &mut assembler,
@@ -1461,14 +1493,28 @@ pub async fn run_supervisor_with_policy(
                 };
                 // A verified spool survives the first render — a second paste
                 // of the same file must not pull the bytes again.
-                if let Some(path) = paste_sink.ready.get(&file_id) {
-                    let _ = reply.try_send(Ok(path.clone()));
+                if let Some(sp) = paste_sink.ready.get(&file_id) {
+                    let _ = reply.try_send(Ok(sp.clone()));
                     continue;
                 }
-                paste_sink.waiters.entry(file_id).or_default().push(reply);
-                if !receives.has_session_for(&file_id) {
-                    match receives.shape(&file_id).cloned() {
-                        Some(shape) => {
+                match receives.shape(&file_id).cloned() {
+                    Some(shape) => {
+                        // Reply immediately: the stream fills in as chunks
+                        // land — the paste's progress tracks the network.
+                        let frontier = paste_sink
+                            .live
+                            .entry(file_id)
+                            .or_insert_with(paste::SpoolFrontier::new)
+                            .clone();
+                        let partial = paste_sink
+                            .spool_dir
+                            .join(format!("{file_id}.partial"));
+                        let _ = reply.try_send(Ok(paste::SpoolStream {
+                            path: partial,
+                            len: shape.file_size,
+                            frontier,
+                        }));
+                        if !receives.has_session_for(&file_id) {
                             let transfer_id =
                                 receives.open(file_id, shape.clone(), now_millis());
                             info!(
@@ -1483,11 +1529,12 @@ pub async fn run_supervisor_with_policy(
                                 Some(shape.from_device),
                             );
                         }
-                        None => {
-                            // The offer expired before the paste; the promise
-                            // outlived what the source will serve.
-                            paste_sink.fail(&file_id, "offer expired or source offline");
-                        }
+                    }
+                    None => {
+                        // The offer expired before the paste; the promise
+                        // outlived what the source will serve.
+                        let _ = reply
+                            .try_send(Err("offer expired or source offline".to_string()));
                     }
                 }
             }
@@ -1614,21 +1661,31 @@ const PROMISE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_mill
 /// straight from disk instead of pulling again.
 #[derive(Default)]
 struct PasteSink {
-    waiters: std::collections::HashMap<
-        Uuid,
-        Vec<std::sync::mpsc::SyncSender<Result<std::path::PathBuf, String>>>,
-    >,
-    ready: std::collections::HashMap<Uuid, std::path::PathBuf>,
+    /// Live renders: streams blocked on a still-pulling file, keyed by
+    /// `file_id`. `finish`ing the frontier releases or fails every reader.
+    live: std::collections::HashMap<Uuid, std::sync::Arc<paste::SpoolFrontier>>,
+    /// Verified spools: a second paste of the same file serves these
+    /// without pulling again.
+    ready: std::collections::HashMap<Uuid, paste::SpoolStream>,
     spool_dir: std::path::PathBuf,
 }
 
 impl PasteSink {
-    /// Fail every blocked `GetData` for `file_id` — Explorer then reports
-    /// "cannot paste" instead of waiting forever.
+    /// End every live render for `file_id` — each reader's next `Read`
+    /// returns an error and the paste target aborts its copy.
     fn fail(&mut self, file_id: &Uuid, reason: &str) {
-        if let Some(ws) = self.waiters.remove(file_id) {
-            for w in ws {
-                let _ = w.try_send(Err(reason.to_string()));
+        if let Some(f) = self.live.remove(file_id) {
+            f.finish(Err(reason.to_string()));
+        }
+    }
+
+    /// Advance the read frontier after a chunk landed.
+    fn advance(&self, receives: &receive::ReceiveEngine, file_id: &Uuid, transfer_id: &Uuid) {
+        if let Some(f) = self.live.get(file_id) {
+            if let Some(session) = receives.session(transfer_id) {
+                let bytes = (session.contiguous as u64 * crate::protocol::FILE_CHUNK_BYTES as u64)
+                    .min(session.file_size);
+                f.update(bytes);
             }
         }
     }

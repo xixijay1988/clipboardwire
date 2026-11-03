@@ -33,12 +33,82 @@ pub struct PromiseFile {
 
 /// Message from the clipboard thread to the supervisor.
 pub enum PasteEvent {
-    /// A paste target asked for `file_id`'s bytes. The supervisor must reply
-    /// with the spooled-and-verified path, or an error to fail the paste.
+    /// A paste target asked for `file_id`'s bytes. The supervisor replies
+    /// immediately — a [`SpoolStream`] whose bytes fill in as the pull lands,
+    /// or an error when the offer is gone. `GetData` returns the `IStream`
+    /// right away; the pull itself streams into it.
     Pull {
         file_id: uuid::Uuid,
-        reply: std::sync::mpsc::SyncSender<Result<PathBuf, String>>,
+        reply: std::sync::mpsc::SyncSender<Result<SpoolStream, String>>,
     },
+}
+
+/// Write-frontier shared between the supervisor (chunk writer) and a
+/// rendering `IStream` (reader).
+///
+/// `committed` is bytes safe to read — the assembler's contiguous prefix.
+/// `outcome` is set exactly once at the end: `Ok` after SHA-256 verification,
+/// `Err` on any failure — which is how a failed pull becomes a failed paste:
+/// the stream's `Read` returns the error and the target deletes its partial
+/// destination file, the same semantics as a network drive dropping mid-copy.
+pub struct SpoolFrontier {
+    inner: std::sync::Mutex<SpoolInner>,
+    cond: std::sync::Condvar,
+}
+
+struct SpoolInner {
+    committed: u64,
+    outcome: Option<Result<(), String>>,
+}
+
+impl SpoolFrontier {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: std::sync::Mutex::new(SpoolInner {
+                committed: 0,
+                outcome: None,
+            }),
+            cond: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Already-verified file: the whole length is readable, EOF at `len`.
+    pub fn completed() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: std::sync::Mutex::new(SpoolInner {
+                committed: u64::MAX,
+                outcome: Some(Ok(())),
+            }),
+            cond: std::sync::Condvar::new(),
+        })
+    }
+
+    /// More verified-contiguous bytes are readable.
+    pub fn update(&self, committed: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.committed = g.committed.max(committed);
+        drop(g);
+        self.cond.notify_all();
+    }
+
+    /// End of story: verified (`Ok`) or failed (`Err` with a reason).
+    pub fn finish(&self, outcome: Result<(), String>) {
+        let mut g = self.inner.lock().unwrap();
+        if g.outcome.is_none() {
+            g.outcome = Some(outcome);
+        }
+        drop(g);
+        self.cond.notify_all();
+    }
+}
+
+/// A renderable file: the partial path plus the frontier that says how much
+/// of it exists. `Clone` is cheap — the frontier is shared.
+#[derive(Clone)]
+pub struct SpoolStream {
+    pub path: PathBuf,
+    pub len: u64,
+    pub frontier: std::sync::Arc<SpoolFrontier>,
 }
 
 /// Handle the supervisor uses to (re)arm the clipboard promise.
@@ -82,8 +152,9 @@ pub fn spool_dir() -> PathBuf {
 
 #[cfg(windows)]
 mod imp {
-    use super::{PasteCommand, PasteEvent, PromiseFile};
-    use std::cell::Cell;
+    use super::{PasteCommand, PasteEvent, PromiseFile, SpoolFrontier};
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
     use tokio::sync::mpsc::UnboundedSender;
     use windows::core::{implement, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{FILETIME, POINTL, SIZE};
@@ -180,42 +251,102 @@ mod imp {
         buf
     }
 
-    /// IStream over an on-disk file — the verified spool, seek-read per call.
-    /// `seek_read` keeps `&self` so no interior mutability is needed for the
-    /// file handle; only the position is a Cell.
+    /// IStream over the pull's partial file, live. `Read` blocks at the
+    /// verified frontier, so Explorer's progress dialog tracks the actual
+    /// network transfer. The final `Read` past `len` waits for the digest
+    /// verdict: verified → clean EOF, failed → error, and Explorer removes
+    /// its half-copied destination itself.
     #[implement(IStream)]
-    struct FileStream {
-        file: std::fs::File,
+    struct SpoolIStream {
+        /// The `.partial` path — opened lazily since it may not exist yet
+        /// when `GetData` arms the stream.
+        path: PathBuf,
+        file: RefCell<Option<std::fs::File>>,
         len: u64,
         pos: Cell<u64>,
+        frontier: std::sync::Arc<SpoolFrontier>,
     }
 
-    impl ISequentialStream_Impl for FileStream_Impl {
+    impl ISequentialStream_Impl for SpoolIStream_Impl {
         fn Read(&self, pv: *mut core::ffi::c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
             if pv.is_null() {
                 return E_FAIL;
             }
-            let want = (cb as usize).min((self.len - self.pos.get()) as usize);
-            if want == 0 {
-                if !pcbread.is_null() {
-                    unsafe { *pcbread = 0 };
+            let mut delivered = 0u32;
+            loop {
+                // Frontier state: bytes readable now + final verdict if set.
+                let (committed, outcome) = {
+                    let g = self.frontier.inner.lock().unwrap();
+                    (g.committed, g.outcome.clone())
+                };
+                let avail = committed.saturating_sub(self.pos.get());
+                if avail > 0 && self.pos.get() < self.len {
+                    let want = ((cb - delivered) as u64)
+                        .min(avail)
+                        .min(self.len - self.pos.get()) as usize;
+                    if want > 0 {
+                        // Open the partial on first use — the pull writes it.
+                        {
+                            let mut file = self.file.borrow_mut();
+                            if file.is_none() {
+                                *file = std::fs::File::open(&self.path).ok();
+                            }
+                        }
+                        let file = self.file.borrow();
+                        let Some(f) = file.as_ref() else {
+                            return E_FAIL;
+                        };
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (pv as *mut u8).add(delivered as usize),
+                                want,
+                            )
+                        };
+                        match std::os::windows::fs::FileExt::seek_read(f, buf, self.pos.get()) {
+                            Ok(0) => {
+                                // Writer hasn't reached this offset yet.
+                            }
+                            Ok(n) => {
+                                self.pos.set(self.pos.get() + n as u64);
+                                delivered += n as u32;
+                                if delivered >= cb {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(_) => return E_FAIL,
+                        }
+                    }
                 }
-                return S_FALSE;
-            }
-            let buf = unsafe { std::slice::from_raw_parts_mut(pv as *mut u8, want) };
-            match std::os::windows::fs::FileExt::seek_read(&self.file, buf, self.pos.get()) {
-                Ok(n) => {
-                    self.pos.set(self.pos.get() + n as u64);
+                if delivered > 0 {
+                    break;
+                }
+                if let Some(outcome) = outcome {
                     if !pcbread.is_null() {
-                        unsafe { *pcbread = n as u32 };
+                        unsafe { *pcbread = delivered };
                     }
-                    if n < want {
-                        S_FALSE
-                    } else {
-                        S_OK
-                    }
+                    return match outcome {
+                        // EOF is legal only once every byte left us.
+                        Ok(()) if self.pos.get() >= self.len => S_FALSE,
+                        Ok(()) => E_FAIL, // "verified" before all bytes served
+                        Err(_) => E_FAIL,
+                    };
                 }
-                Err(_) => E_FAIL,
+                // Nothing readable — block until the writer advances or
+                // finishes. Hold the mutex across the wait.
+                let mut g = self.frontier.inner.lock().unwrap();
+                if g.committed <= self.pos.get() && g.outcome.is_none() {
+                    g = self.frontier.cond.wait(g).unwrap();
+                }
+                drop(g);
+            }
+            if !pcbread.is_null() {
+                unsafe { *pcbread = delivered };
+            }
+            if delivered < cb {
+                S_FALSE
+            } else {
+                S_OK
             }
         }
         fn Write(&self, _pv: *const core::ffi::c_void, _cb: u32, _w: *mut u32) -> HRESULT {
@@ -223,7 +354,7 @@ mod imp {
         }
     }
 
-    impl IStream_Impl for FileStream_Impl {
+    impl IStream_Impl for SpoolIStream_Impl {
         fn Seek(
             &self,
             mv: i64,
@@ -413,8 +544,8 @@ mod imp {
                     file_id = %file.file_id,
                     "paste requested; starting pull"
                 );
-                // Block this STA thread until the supervisor finishes the
-                // pull: the spool path arrives verified or not at all.
+                // The supervisor replies with a live SpoolStream immediately;
+                // the pull streams into it while the target reads.
                 let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
                 if self
                     .events
@@ -426,20 +557,20 @@ mod imp {
                 {
                     return Err(E_FAIL.into());
                 }
-                let path = match reply_rx.recv() {
-                    Ok(Ok(p)) => p,
+                let spool = match reply_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "paste pull failed");
+                        tracing::warn!(error = %e, "paste pull could not start");
                         return Err(E_FAIL.into());
                     }
                     Err(_) => return Err(E_FAIL.into()),
                 };
-                let file = std::fs::File::open(&path).map_err(|_| E_FAIL)?;
-                let len = file.metadata().map_err(|_| E_FAIL)?.len();
-                let stream = IStream::from(FileStream {
-                    file,
-                    len,
+                let stream = IStream::from(SpoolIStream {
+                    path: spool.path,
+                    file: RefCell::new(None),
+                    len: spool.len,
                     pos: Cell::new(0),
+                    frontier: spool.frontier,
                 });
                 return Ok(STGMEDIUM {
                     tymed: TYMED_ISTREAM.0 as u32,

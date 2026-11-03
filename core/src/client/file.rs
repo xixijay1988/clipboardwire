@@ -253,7 +253,7 @@ fn mime_for(path: &Path) -> String {
     .to_string()
 }
 
-fn sha256_of_path(path: &Path) -> Result<String> {
+pub(crate) fn sha256_of_path(path: &Path) -> Result<String> {
     sha256_of_path_with_progress(path, |_| {})
 }
 
