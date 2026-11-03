@@ -461,7 +461,25 @@ bound is a bound on the *span*, not a claim that the span is short; closing it
 further would need a per-chunk identity check, which costs a stat per chunk on
 the read path.
 
-<!-- Phase 6/7: paste paths, pending spikes 0.1/0.2 -->
+### Windows paste mode (`receive_mode = "paste"`, `core/src/client/paste.rs`)
+
+Offers never touch Downloads in this mode. The supervisor registers the
+offer's shape, batches the copy into one `FILEGROUPDESCRIPTORW`, and a
+dedicated STA thread arms an OLE `IDataObject` on the clipboard via
+`OleSetClipboard`. A paste target (Explorer, Office, a file dialog) asking for
+`FileContents` is what starts the pull: `GetData` blocks on the STA thread
+while the supervisor runs the normal lazy pull into `%TEMP%\clipboardwire-paste`,
+verifies the SHA-256, then answers with an `IStream` over the verified file.
+A failed pull fails the paste — unverified bytes can never reach the target.
+The object also implements `IDataObjectAsyncCapability`, which is what makes
+Explorer wrap the paste in its own async progress UI rather than freezing on
+the synchronous `GetData`.
+
+macOS deliberately has no equivalent: Finder does not invoke a file-promise
+provider on Cmd+V, so `receive_mode = "paste"` resolves to `pickup` there.
+
+The spool is invisible cache — pulled once, served to every later paste of
+the same `file_id` without pulling again; `%TEMP%` reclaims it.
 
 ## 4. The `clipboardwire` binary (`cli/`)
 

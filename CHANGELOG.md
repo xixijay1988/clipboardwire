@@ -6,9 +6,47 @@ follows [Semantic Versioning](https://semver.org).
 
 ## Unreleased
 
-Phase 4 of the lazy file-transfer work: identity and configuration plumbing.
-**No user-visible transfer behaviour changes yet** — both modes still default
-to `eager`, and the client does not advertise `lazy-file`.
+Lazy file transfer (protocol v0.4) and paste-on-demand receiving are live.
+
+### Lazy transfer — `send_mode = "lazy"`
+
+Copying a file now broadcasts a `file_offer` instead of streaming every
+chunk. Receivers pull the bytes they want, in windows, from the source —
+with resumable sessions, digest verification, and replayed-offer dedup.
+`send_mode` and `receive_mode` are separate settings; `auto` resolves to
+`pickup` where a tray exists.
+
+### Paste mode — `receive_mode = "paste"` (Windows)
+
+Files arrive as an OLE clipboard promise (`FileGroupDescriptorW` +
+`FileContents`, delayed rendering). Nothing is downloaded and nothing
+appears in Downloads when you copy: the pull starts the moment a paste
+target asks for `FileContents`, streams through `%TEMP%\clipboardwire-paste`,
+and is digest-verified before any byte reaches the destination. Explorer
+shows a real progress dialog for large files. Not available on macOS —
+Finder cannot fire a promise provider on Cmd+V, so `paste` resolves to
+`pickup` there.
+
+### Reliability fixes
+
+- Reconnecting clients receive offers published while they were away;
+  duplicate replayed offers no longer double-download.
+- A digest that overtakes the tail chunks is stored and the transfer
+  completes instead of restarting from zero.
+- The embedded hub survives unchanged settings reloads (no spurious rebind).
+- The hub's per-peer routed-frame channel gained a 32-slot overflow lane;
+  broadcast aborts no longer hit the floor under burst load.
+- Quitting sends a WebSocket Close frame + TLS close_notify (peers no longer
+  log "peer closed without close_notify" on every exit).
+- A copy made during the connect→welcome window no longer downgrades to
+  eager spuriously (`hub_caps` is `Option`, unknown ≠ incapable).
+
+### Tray
+
+- Menu shows the build stamp (`vX.Y.Z-tag+g<sha>`) and no longer renders a
+  block of empty disabled rows when nothing is transferring.
+
+### Identity & config (Phase 4 plumbing, carried over)
 
 ### ⚠️ Config compatibility
 

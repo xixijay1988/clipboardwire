@@ -87,14 +87,14 @@ mod imp {
     use tokio::sync::mpsc::UnboundedSender;
     use windows::core::{implement, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{FILETIME, POINTL, SIZE};
-    use windows::Win32::System::Com::*;
     use windows::Win32::System::Com::IBindCtx;
+    use windows::Win32::System::Com::*;
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::{OleInitialize, OleSetClipboard, DROPEFFECT_COPY};
     use windows::Win32::UI::Shell::{
-        FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, IDataObjectAsyncCapability,
-        IDataObjectAsyncCapability_Impl,
+        IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, FILEDESCRIPTORW,
+        FILEGROUPDESCRIPTORW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,

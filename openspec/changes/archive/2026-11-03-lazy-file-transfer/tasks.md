@@ -3,6 +3,32 @@
 Each phase is independently reviewable. Phase 0 decides whether later phases
 exist; do not start Phase 6/7 before its gate clears.
 
+## Outcome (archived 2026-11-03)
+
+**Shipped.** All of Phases 1–5 plus the Windows paste path are live on
+`fix/file-copy-shadow-clips` (commits `cdc50f0`…`2f5344a`), verified
+Mac↔Windows on real hardware.
+
+- **Phase 0**: 0.2 (Windows OLE spike) passed — `OleSetClipboard` +
+  `IDataObject`/`IStream` rendered a 5 MiB promise byte-exact under real
+  Explorer. 0.1 (macOS promise) was closed without a spike: Finder does not
+  invoke a file-promise provider on Cmd+V, so macOS resolves `paste` to
+  `pickup` — task 7.4's fallback is the shipped answer.
+- **Phase 6**: implemented as `core/src/client/paste.rs` — a dedicated STA
+  thread owns the promise object (not named `clipboardwire-ole`); `GetData`
+  bridges to the tokio supervisor, pulls into `%TEMP%\clipboardwire-paste`,
+  verifies the digest, then serves `IStream`. `IDataObjectAsyncCapability` is
+  implemented so Explorer shows a real progress dialog. Items 6.4–6.6 are
+  open follow-ups (no inactivity timeout on render, no `file_abort` on
+  promise release — promise loss is natural clipboard takeover).
+- **Phase 7**: closed by the 0.1 gate verdict — no AppKit work.
+- **Phase 8**: 8.2–8.5 done in `PROTOCOL.md` (v0.4). 8.7 partially (this
+  archive summary). 8.6 done in `ARCHITECTURE.md`. 8.8 verified against a
+  real hub. 8.9/8.10 not exercised on v0.3 peers — accepted risk.
+
+Original checklist below, preserved verbatim.
+
+
 ## Phase 0 — gates with written pass/fail criteria
 
 - [ ] 0.1 **macOS promise spike.** Checklist (all must pass): Paste menu item

@@ -82,6 +82,33 @@ After the per-platform checklist passes:
 4. **Image:** copy a small image (e.g. screenshot, a tiny PNG from a
    web page) on A → paste on B. Same image. (v0.2.0+ only.)
 
+### File transfer — lazy + paste mode (v0.4, Windows receiver)
+
+With `send_mode = "lazy"` on the sender and `receive_mode = "paste"` on a
+Windows receiver:
+
+5. **Copy, then wait.** Copy a file on A. On the Windows side *nothing
+   should appear in `Downloads\clipboardwire`* — the clipboard holds a
+   promise, not a file. The spool `%TEMP%\clipboardwire-paste` stays
+   empty too until someone pastes.
+6. **Paste.** In a native Explorer window, Ctrl+V → a pull starts at that
+   instant (log: `paste requested; starting pull`), a progress dialog
+   shows for big files, and the file lands in the paste directory with
+   correct bytes (compare SHA-256).
+7. **Re-paste.** Ctrl+V again in a different folder — the file lands a
+   second time *without* pulling again (served from the verified spool).
+8. **Stale promise.** Copy file X, then copy file Y, then paste — you get
+   Y (the latest copy always wins the clipboard).
+9. **Version stamp.** Right-click the tray icon → bottom item reads
+   `clipboardwire vX.Y.Z-tag+g<sha>`; menu has no large empty gap.
+
+### Pickup mode (macOS / Windows receiver, `receive_mode = "auto"`)
+
+10. **Copy → file appears.** Copy a file on A → after the transfer the
+    file exists in B's `Downloads/clipboardwire` (or configured save dir)
+    *and* B's clipboard contains the file — Ctrl+V in Explorer/Finder
+    copies it into the paste destination.
+
 ## What this checklist intentionally doesn't try to automate
 
 - **Right-click → menu open.** Each platform's tray icon is dispatched

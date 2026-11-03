@@ -192,5 +192,12 @@
   "polish_remaining": [
     "send close frame before unbind on Quit",
     "hub_caps empty-window eager downgrade"
-  ]
+  ],
+  "lazy10_polish": {
+    "commit": "2f5344a (WS/TLS close on quit + Option<Caps> welcome window)",
+    "build": "dist/lazy10; mac installed PID 85746 via open/launchd",
+    "pending_operation": "cw-xs-office-lazy10-deploy",
+    "tag": "v0.5.4-lazy9 tagged at c3b5466-era state"
+  },
+  "lazy10_result": "DEPLOYED PID 39160, stamp lazy10-2f5344a-dirty, zero warnings since start; paste config intact"
 }
