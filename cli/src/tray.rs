@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 #[cfg(windows)]
 use tray_icon::menu::CheckMenuItem;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 /// Events delivered to the tao event loop from background sources.
@@ -373,11 +373,9 @@ pub fn run(
     let version_item = MenuItem::new(version_label(), false, None);
     menu.append(&status_item)?;
     menu.append(&server_item)?;
-    menu.append(&hub_info_item)?;
-    menu.append(&transfer_header_item)?;
-    for item in &transfer_items {
-        menu.append(item)?;
-    }
+    // Dynamic block — hub info, transfer header, per-transfer rows — is NOT
+    // appended here. Each row joins only while it has text (see MenuLayout);
+    // a permanently-empty disabled row renders as a blank line in the menu.
     menu.append(&sep0)?;
     menu.append(&edit_item)?;
     menu.append(&reload_item)?;
@@ -391,6 +389,14 @@ pub fn run(
     menu.append(&version_item)?;
     menu.append(&quit_item)?;
 
+    let menu_layout = {
+        let mut order = vec![hub_info_item.id().clone(), transfer_header_item.id().clone()];
+        order.extend(transfer_items.iter().map(|i| i.id().clone()));
+        MenuLayout {
+            sep_id: sep0.id().clone(),
+            dynamic_order: order,
+        }
+    };
     let edit_id = edit_item.id().clone();
     let reload_id = reload_item.id().clone();
     #[cfg(windows)]
@@ -417,7 +423,7 @@ pub fn run(
     };
     let tray = TrayIconBuilder::new()
         .with_icon(build_icon(theme, None, false))
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_tooltip(initial_tooltip)
         .build()?;
 
@@ -472,7 +478,7 @@ pub fn run(
     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
     update_status_item(&status_item, &state);
     update_server_item(&server_item, &state);
-    update_hub_info_item(&hub_info_item, &state);
+    update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
     refresh_icon(&tray, theme, &state);
 
     // First-run / no-valid-config flow: pop the settings GUI so the
@@ -497,7 +503,7 @@ pub fn run(
         // and ordinary events both get the cleanup, and no arm can shadow
         // another by matching here.
         if state.expire_transfers() {
-            update_transfer_items(&transfer_header_item, &transfer_items, &state);
+            update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
             refresh_tooltip(&tray, &state, &config_path);
         }
         // Wait, unless a finished transfer is due to disappear: then wake up at
@@ -533,7 +539,7 @@ pub fn run(
                     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
                     update_status_item(&status_item, &state);
                     update_server_item(&server_item, &state);
-                    update_hub_info_item(&hub_info_item, &state);
+                    update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                     refresh_icon(&tray, theme, &state);
                 } else if menu_event.id == start_hub_id {
                     if let Err(e) =
@@ -543,13 +549,13 @@ pub fn run(
                     }
                     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
                     update_status_item(&status_item, &state);
-                    update_hub_info_item(&hub_info_item, &state);
+                    update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                     refresh_tooltip(&tray, &state, &config_path);
                     refresh_icon(&tray, theme, &state);
                 } else if menu_event.id == stop_hub_id {
                     stop_embedded_hub(&mut state);
                     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
-                    update_hub_info_item(&hub_info_item, &state);
+                    update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                     refresh_icon(&tray, theme, &state);
                 } else if menu_event.id == restart_hub_id {
                     stop_embedded_hub(&mut state);
@@ -560,7 +566,7 @@ pub fn run(
                     }
                     update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
                     update_status_item(&status_item, &state);
-                    update_hub_info_item(&hub_info_item, &state);
+                    update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                     refresh_tooltip(&tray, &state, &config_path);
                     refresh_icon(&tray, theme, &state);
                 } else {
@@ -600,7 +606,7 @@ pub fn run(
                 // stale percentages.
                 state.transfers.clear();
                 state.transfer_clear_at.clear();
-                update_transfer_items(&transfer_header_item, &transfer_items, &state);
+                update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
                 warn!(
                     gen = generation,
                     summary, "supervisor exited on its own; staying in tray"
@@ -620,7 +626,7 @@ pub fn run(
                 update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
             }
             Event::UserEvent(UserEvent::HubPeerCountChanged) => {
-                update_hub_info_item(&hub_info_item, &state);
+                update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                 refresh_tooltip(&tray, &state, &config_path);
             }
             Event::UserEvent(UserEvent::TransferProgress {
@@ -628,7 +634,7 @@ pub fn run(
                 progress,
             }) if is_live_supervisor_event(&state, generation) => {
                 state.record_progress(*progress);
-                update_transfer_items(&transfer_header_item, &transfer_items, &state);
+                update_transfer_items(&menu, &menu_layout, &transfer_header_item, &transfer_items, &state);
                 refresh_tooltip(&tray, &state, &config_path);
             }
             Event::UserEvent(UserEvent::ThemeChanged(new_theme)) => {
@@ -655,7 +661,7 @@ pub fn run(
                 update_hub_menu(&state, &start_hub_item, &stop_hub_item, &restart_hub_item);
                 update_status_item(&status_item, &state);
                 update_server_item(&server_item, &state);
-                update_hub_info_item(&hub_info_item, &state);
+                update_hub_info_item(&menu, &menu_layout, &hub_info_item, &state);
                 refresh_tooltip(&tray, &state, &config_path);
                 refresh_icon(&tray, theme, &state);
             }
@@ -1063,13 +1069,51 @@ fn server_label(cfg: Option<&ClientConfig>) -> String {
 /// Refresh the disabled hub-info menu item. Shows the connected-peer
 /// count when the hub is running, empty otherwise. Tooltips are
 /// unreliable on Linux, so this surfaces the same info in the menu.
-fn update_hub_info_item(item: &MenuItem, state: &State) {
+fn update_hub_info_item(menu: &Menu, layout: &MenuLayout, item: &MenuItem, state: &State) {
     let text = hub_info_label(state);
-    // Hide the item when there's nothing to show (no hub running).
-    if text.is_empty() {
-        item.set_text("");
-    } else {
+    layout.sync_item(menu, item, !text.is_empty());
+    if !text.is_empty() {
         item.set_text(text);
+    }
+}
+
+/// Positions of the menu's dynamic block — the hub-info row, the transfer
+/// header and the per-transfer slots. Fixed items live outside it; a row is
+/// only ever *in* the menu while it has text, because an appended item with
+/// `set_text("")` still renders as a blank row. `menu.remove` may fail on a
+/// platform that cannot remove items; that degrades to the old blank-row
+/// look, which is acceptable, so the results are ignored.
+struct MenuLayout {
+    /// Separator that ends the dynamic block — the insertion anchor.
+    sep_id: MenuId,
+    /// Slot order inside the block: [hub_info, header, slot0..N].
+    dynamic_order: Vec<MenuId>,
+}
+
+impl MenuLayout {
+    /// Ensure `item` sits in the menu exactly when `show` is true, in
+    /// `dynamic_order` position. Text is written separately via `set_text`.
+    fn sync_item(&self, menu: &Menu, item: &MenuItem, show: bool) {
+        let items = menu.items();
+        let present = items.iter().position(|k| k.id() == item.id()).is_some();
+        if show && !present {
+            let pos = self
+                .dynamic_order
+                .iter()
+                .position(|id| id == item.id())
+                .unwrap_or(usize::MAX);
+            let anchor = self
+                .dynamic_order
+                .iter()
+                .skip(pos + 1)
+                .find_map(|id| items.iter().position(|k| k.id() == id))
+                .or_else(|| items.iter().position(|k| k.id() == &self.sep_id));
+            if let Some(i) = anchor {
+                let _ = menu.insert(item, i);
+            }
+        } else if !show && present {
+            let _ = menu.remove(item);
+        }
     }
 }
 
@@ -1321,16 +1365,29 @@ fn fit_chars(s: &str, max: usize) -> String {
 /// The header names the count; each slot lists one transfer. Empty slots are
 /// blanked rather than hidden, because adding/removing menu items on every
 /// chunk event makes some platforms flicker.
-fn update_transfer_items(header: &MenuItem, items: &[MenuItem], state: &State) {
-    if state.transfers.is_empty() {
-        header.set_text("");
+fn update_transfer_items(
+    menu: &Menu,
+    layout: &MenuLayout,
+    header: &MenuItem,
+    items: &[MenuItem],
+    state: &State,
+) {
+    let header_text = if state.transfers.is_empty() {
+        String::new()
     } else {
-        header.set_text(format_transfer_header(&state.transfers));
+        format_transfer_header(&state.transfers)
+    };
+    layout.sync_item(menu, header, !header_text.is_empty());
+    if !header_text.is_empty() {
+        header.set_text(header_text);
     }
     for (slot, item) in items.iter().enumerate() {
         match state.transfers.get(slot) {
-            Some(t) => item.set_text(format!("  {}", t.summary_line(40))),
-            None => item.set_text(""),
+            Some(t) => {
+                layout.sync_item(menu, item, true);
+                item.set_text(format!("  {}", t.summary_line(40)));
+            }
+            None => layout.sync_item(menu, item, false),
         }
     }
 }
