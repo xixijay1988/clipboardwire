@@ -112,3 +112,11 @@ If a workflow cannot span turns, do not reach for the Lody MCP — use the CLI
 `agent` tool instead. Its result arrives as a `<notification>` inside the running
 turn, so no turn release is needed. The trade-off is that it runs locally rather
 than as a separate Lody session with its own role and config.
+
+## Dispatch permission mode
+
+The user asked that delegated sessions on XS-Office run without interactive
+permission prompts. `lody_session_chat` cannot change a session's permission
+mode — mode is fixed at creation. Use `lody_session_create` with
+`machineId` + `agentConfigId` (from `lody_session_create_options`) and
+`modeId: "bypass"` for diagnostic sessions there.

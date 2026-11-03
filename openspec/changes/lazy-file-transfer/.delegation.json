@@ -97,9 +97,9 @@
   },
   "investigation_2026_10_30": {
     "session": "devin session b6091187 on dawn-MacBookAir (this session)",
-    "round": 1,
-    "pending_operation": "cw-xs-office-disconnect-diag",
-    "last_result": "fix committed locally: 592a999 (welcome.offers forwarded; replay dedup; abort->resume restart; hub retracts aborted offers). Tests: 3 new in core/tests/welcome_offers_replay.rs; full suite green, clippy/fmt clean.",
+    "round": 2,
+    "pending_operation": null,
+    "last_result": "d062c9a committed: hub keep-alive on reload + early-digest tolerance. 458 tests green incl. 4 new e2e (welcome_offers_replay) + 3 engine + 1 tray.",
     "user_symptoms": "copied files often cannot paste on remote (old clipboard stays); large files fail; 'does not seem lazy'; very unstable (~17 close_notify TCP drops on 2026-10-29)",
     "fixed_already": [
       "welcome.offers parsed but dropped by client transport -> offers published while peer offline/reconnecting were permanently lost. Reproduced red->green (welcome_offers_replay.rs).",
@@ -107,13 +107,50 @@
       "hub kept retracted (superseded) offers in registry -> replayed to late joiners. Now removed on owner offer-scoped abort."
     ],
     "still_open": [
-      "root cause of the ~17 TCP-level close_notify drops on 2026-10-29 (04:00,06:02,07:24,08:04 UTC) - delegated to XS-Office session for remote-side evidence",
       "eager broadcast chunk drop on hub queue Full is silent (corrupt file, no abort marker) - code-confirmed, not yet fixed",
-      "hub_caps empty before first welcome -> copies in that window downgrade to eager + misleading 'for this and later copies' warn - minor",
-      "restart_or_fail (chunk-hole/digest-incomplete) path still restarts from index 0 - bitmap destroyed inside engine",
-      "directory copies are skipped by design (tray shows Failed since a27bccc)",
-      "MAX_RESTARTS=3 budget now also caps stall/abort resumes - under a sustained outage a transfer gives up after ~3 resumes"
+      "hub_caps empty before first welcome -> copies in that window downgrade to eager + misleading warn text - minor",
+      "restart_or_fail (chunk-hole) path still restarts from index 0 - bitmap destroyed inside engine",
+      "close frame before unbind on Quit/rebind - polish",
+      "MAX_RESTARTS=3 budget now also caps stall/abort resumes - sustained outage still gives up eventually (by design, flaggable)",
+      "needs fresh test builds (macOS + Windows) for real-world verification - the XS-OFFICE box runs embedded hub + client in one exe"
     ],
-    "next_action": "when cw-xs-office-disconnect-diag returns, correlate its log/process findings with the Mac-side drop timestamps and decide whether drops are hub-process restarts, machine sleep, or network; do not edit core/src/cli/src from this session if a builder role is reassigned"
+    "next_action": "when cw-xs-office-disconnect-diag returns, correlate its log/process findings with the Mac-side drop timestamps and decide whether drops are hub-process restarts, machine sleep, or network; do not edit core/src/cli/src from this session if a builder role is reassigned",
+    "xs_office_report": {
+      "answered": "all 17 TCP drops are user-driven: 4x tray Quit restarts while iterating lazy->lazy2->lazy3 builds (04:00,06:43,07:24,08:04 UTC) + embedded-hub rebind on every config save (04:01,06:02,06:03,07:24:18,08:05:06) + Mac superseded-device reconnect storm (08:07). No crashes, no sleeps, no network faults.",
+      "hub_is": "XS-OFFICE itself: clipboardwire-0.5.4-lazy3 exe, [hub] enabled=true bound 0.0.0.0:8484, its own client connects wss://DESKTOP-6F98S6.local:8484",
+      "new_defects_from_report": [
+        "config reload -> unconditional embedded hub rebind -> drops all peers. FIXED d062c9a (hub_restart_unneeded + snapshot compare).",
+        "digest overtakes tail chunks via hub's separate queues -> 5x/day full re-download. FIXED d062c9a (Early digest stored, last chunk completes).",
+        "Quit/rebind closes sockets without WS close frame - polish only, logged"
+      ]
+    }
+  },
+  "lazy4_field_test_2026_11_03": {
+    "round": 3,
+    "pending_operation": "cw-xs-office-clipboard-probe-r3",
+    "context": "user tested lazy4 Mac->Windows. On Windows, file appeared in Downloads/clipboardwire but Explorer paste did nothing. Suspects: .partial left behind (stall/budget exhaustion - Mac side itself logged 'giving up after 4 restarts' at 03:29:33Z) OR CF_HDROP apply failed (set_files warn) OR apply never ran.",
+    "local_evidence": "Mac log 2026-11-03: received 2 files from Windows fine (saved+applied); one pull stalled then gave up after 4 restarts; two TLS drops at 03:29:09-15 (likely user restarting Windows app for lazy4 deploy). No INFO-level offer lines (send side logs at debug).",
+    "next_action": "read XS-OFFICE log + Downloads dir listing to classify which failure mode; then decide fix",
+    "note": "first dispatch TARGET_FAILED (non-retryable), retried",
+    "findings": "lazy4 confirmed running (PID 36896). 3 files saved+applied, zero clipboard errors, zero .partial. Case (c): applied but Explorer paste failed. Suspects: clipboard clobbered by later text sync, or CF_HDROP write ineffective.",
+    "hub_note": "hub dropped broadcast abort frames at 03:25:15 (routed-frame buffer full) - congestion signal, track separately",
+    "xs_office_probe_session": "5542d14f-757d-40f7-b98f-d3f68476aa80"
+  },
+  "dispatch_note": "USER REQUEST: always create XS-Office sessions with modeId='bypass' (lody_session_create + machineId/agentConfigId); session_chat cannot change permission mode of an existing session.",
+  "paste_mode_spike_a": {
+    "pending_operation": "cw-xs-office-olespike-run2",
+    "session": "5542d14f-757d-40f7-b98f-d3f68476aa80",
+    "artifact": "ole-spike.exe serve|probe — IDataObject promise + MemStream FILECONTENTS; sent to XS-OFFICE via lazy4 itself",
+    "design_doc": "openspec/changes/lazy-file-transfer/paste-mode-design.md",
+    "next": "if probe reads FILECONTENTS OK, ask user to Ctrl+V in real Explorer on XS-OFFICE, then read serve.log for GetData lines",
+    "round1_result": "CRASHED at startup: Vec capacity-chasing bug in synthetic payload (while v.len()<v.capacity() -> 40GiB alloc). Fixed, rebuilt, resent via clipboardwire.",
+    "status": "VERIFIED: real Explorer Ctrl+V on XS-OFFICE rendered cw-spike-5mb.txt byte-exact (probe + Explorer both green)"
+  },
+  "paste_mode_impl": {
+    "commit": "927ac06",
+    "pending_operation": "cw-xs-office-lazy5-paste-test",
+    "build": "dist/lazy5 (mac aarch64 + windows exe)",
+    "local": "lazy5 installed, PID 17122, connected",
+    "test": "XS-OFFICE: deploy lazy5, receive_mode=paste, watch for promise arm + pull-on-paste"
   }
 }
