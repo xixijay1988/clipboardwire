@@ -88,10 +88,14 @@ mod imp {
     use windows::core::{implement, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{FILETIME, POINTL, SIZE};
     use windows::Win32::System::Com::*;
+    use windows::Win32::System::Com::IBindCtx;
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::{OleInitialize, OleSetClipboard, DROPEFFECT_COPY};
-    use windows::Win32::UI::Shell::{FILEDESCRIPTORW, FILEGROUPDESCRIPTORW};
+    use windows::Win32::UI::Shell::{
+        FILEDESCRIPTORW, FILEGROUPDESCRIPTORW, IDataObjectAsyncCapability,
+        IDataObjectAsyncCapability_Impl,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
@@ -281,6 +285,39 @@ mod imp {
         }
     }
 
+    impl IDataObjectAsyncCapability_Impl for PromiseDataObject_Impl {
+        /// The flags only tell the consumer whether async operations are
+        /// permitted; the actual bytes still flow through `GetData`, which
+        /// already blocks for the pull. Advertising this is what makes
+        /// Explorer wrap the paste in a progress UI.
+        fn SetAsyncMode(&self, fdoopasync: windows::core::BOOL) -> windows::core::Result<()> {
+            self.async_mode.set(fdoopasync.as_bool());
+            Ok(())
+        }
+        fn GetAsyncMode(&self) -> windows::core::Result<windows::core::BOOL> {
+            Ok(self.async_mode.get().into())
+        }
+        fn StartOperation(
+            &self,
+            _pbcreserved: windows::core::Ref<'_, IBindCtx>,
+        ) -> windows::core::Result<()> {
+            self.in_operation.set(true);
+            Ok(())
+        }
+        fn InOperation(&self) -> windows::core::Result<windows_core::BOOL> {
+            Ok(self.in_operation.get().into())
+        }
+        fn EndOperation(
+            &self,
+            _hresult: HRESULT,
+            _pbcreserved: windows::core::Ref<'_, IBindCtx>,
+            _dweffects: u32,
+        ) -> windows::core::Result<()> {
+            self.in_operation.set(false);
+            Ok(())
+        }
+    }
+
     #[implement(IEnumFORMATETC)]
     struct FormatEnum {
         items: Vec<FORMATETC>,
@@ -327,11 +364,17 @@ mod imp {
         }
     }
 
-    #[implement(IDataObject)]
+    #[implement(IDataObject, IDataObjectAsyncCapability)]
     struct PromiseDataObject {
         formats: Formats,
         files: Vec<PromiseFile>,
         events: UnboundedSender<PasteEvent>,
+        /// Reported via `IDataObjectAsyncCapability`. With it set, Explorer
+        /// runs `GetData` inside its own async operation — a real progress
+        /// dialog and a cancellable paste instead of a frozen busy cursor
+        /// while a large file pulls.
+        async_mode: Cell<bool>,
+        in_operation: Cell<bool>,
     }
 
     impl PromiseDataObject {
@@ -523,6 +566,8 @@ mod imp {
                                 },
                                 files,
                                 events: events.clone(),
+                                async_mode: Cell::new(true),
+                                in_operation: Cell::new(false),
                             });
                             if OleSetClipboard(&obj).is_ok() {
                                 tracing::debug!("clipboard promise armed");
