@@ -4,7 +4,7 @@ All notable changes to clipboardwire are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## [0.5.5] — 2026-11-03
 
 Lazy file transfer (protocol v0.4) and paste-on-demand receiving are live.
 
