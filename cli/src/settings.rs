@@ -20,6 +20,12 @@
 //! | `tls_ca_file`   | optional | text path                                |
 //! | `tls_insecure`  | optional | checkbox                                 |
 //!
+//! When `[hub].enabled` is set, the Connection/Security cards collapse
+//! into a note: the local client joins the embedded hub over loopback,
+//! so `server` is written as `wss://127.0.0.1:<hub port>/sync` and
+//! `user`/`password` mirror the hub credentials — the same values the
+//! tray derives at runtime.
+//!
 //! Exits with code 0 on Save, 1 on Cancel / window close.
 
 use std::path::{Path, PathBuf};
@@ -37,6 +43,188 @@ use eframe::egui;
 const DEFAULT_POLL_MS: u64 = 300;
 const WINDOW_TITLE: &str = "clipboardwire — settings";
 
+// ---------------------------------------------------------------------
+// Visual theme — see openspec/changes/settings-ui-redesign/design.md.
+// Light slate page, white cards, restrained blue accent. Geometry is in
+// logical points.
+// ---------------------------------------------------------------------
+
+use egui::{Color32, CornerRadius, FontId, Margin, Stroke, TextStyle};
+
+const PAGE: Color32 = Color32::from_rgb(244, 246, 250);
+const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
+const FIELD: Color32 = Color32::from_rgb(248, 250, 252);
+const HOVER: Color32 = Color32::from_rgb(235, 241, 249);
+const BORDER: Color32 = Color32::from_rgb(203, 213, 225);
+const TEXT: Color32 = Color32::from_rgb(30, 41, 59);
+const MUTED: Color32 = Color32::from_rgb(71, 85, 105);
+const ACCENT: Color32 = Color32::from_rgb(29, 78, 216);
+const ACCENT_HOVER: Color32 = Color32::from_rgb(30, 64, 175);
+const ACCENT_ACTIVE: Color32 = Color32::from_rgb(30, 58, 138);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(219, 234, 254);
+const ON_ACCENT: Color32 = Color32::WHITE;
+const WARNING: Color32 = Color32::from_rgb(146, 64, 14);
+
+const PAGE_MARGIN: i8 = 20;
+const CARD_PADDING: i8 = 16;
+const BAR_PADDING_Y: i8 = 12;
+const CARD_RADIUS: u8 = 10;
+const CONTROL_RADIUS: u8 = 6;
+const POPUP_RADIUS: u8 = 8;
+const SPACE_LABEL: f32 = 4.0;
+const SPACE_INLINE: f32 = 8.0;
+const SPACE_FIELD: f32 = 12.0;
+const SPACE_CARD: f32 = 16.0;
+const CONTROL_HEIGHT: f32 = 32.0;
+const ACTION_SIZE: [f32; 2] = [96.0, 36.0];
+const NUMERIC_WIDTH: f32 = 112.0;
+const STATUS_MAX_HEIGHT: f32 = 64.0;
+const FONT_TITLE: f32 = 22.0;
+const FONT_SECTION: f32 = 16.0;
+const FONT_BODY: f32 = 14.0;
+const FONT_SMALL: f32 = 12.0;
+const STROKE_NORMAL: f32 = 1.0;
+const STROKE_FOCUS: f32 = 2.0;
+const DISABLED_ALPHA: f32 = 0.55;
+
+fn settings_style() -> egui::Style {
+    let mut s = egui::Style::default();
+    s.text_styles
+        .insert(TextStyle::Heading, FontId::proportional(FONT_TITLE));
+    s.text_styles
+        .insert(TextStyle::Body, FontId::proportional(FONT_BODY));
+    s.text_styles
+        .insert(TextStyle::Button, FontId::proportional(FONT_BODY));
+    s.text_styles
+        .insert(TextStyle::Small, FontId::proportional(FONT_SMALL));
+    s.text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(FONT_SMALL));
+    s.spacing.item_spacing = egui::vec2(SPACE_INLINE, SPACE_LABEL);
+    s.spacing.button_padding = egui::vec2(12.0, 6.0);
+    s.spacing.interact_size = egui::vec2(40.0, CONTROL_HEIGHT);
+    s.spacing.indent = 16.0;
+    s.spacing.icon_width = 18.0;
+    s.spacing.icon_width_inner = 10.0;
+    s.spacing.icon_spacing = SPACE_INLINE;
+    s.spacing.text_edit_width = 280.0; // fallback; fields explicitly fill width
+    s.spacing.combo_width = 280.0; // fallback; combos explicitly fill width
+    s.animation_time = 0.0; // deterministic disclosure/test frames
+    s.wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+    let mut v = egui::Visuals::light();
+    v.override_text_color = None; // preserve per-state and disabled text styling
+    v.weak_text_color = Some(MUTED);
+    v.panel_fill = PAGE;
+    v.window_fill = SURFACE;
+    v.window_stroke = Stroke::new(STROKE_NORMAL, BORDER);
+    v.window_corner_radius = CornerRadius::same(CARD_RADIUS);
+    v.menu_corner_radius = CornerRadius::same(POPUP_RADIUS);
+    v.extreme_bg_color = FIELD;
+    v.text_edit_bg_color = Some(FIELD);
+    v.faint_bg_color = FIELD;
+    v.code_bg_color = FIELD;
+    v.hyperlink_color = ACCENT;
+    v.warn_fg_color = WARNING;
+    v.selection.bg_fill = ACCENT_SOFT;
+    v.selection.stroke = Stroke::new(STROKE_NORMAL, ACCENT);
+    v.disabled_alpha = DISABLED_ALPHA;
+    v.collapsing_header_frame = true;
+    v.indent_has_left_vline = false;
+    for (w, fill, border, width) in [
+        (
+            &mut v.widgets.noninteractive,
+            SURFACE,
+            BORDER,
+            STROKE_NORMAL,
+        ),
+        (&mut v.widgets.inactive, FIELD, BORDER, STROKE_NORMAL),
+        (&mut v.widgets.hovered, HOVER, ACCENT, STROKE_NORMAL),
+        (&mut v.widgets.active, ACCENT_SOFT, ACCENT, STROKE_FOCUS),
+        (&mut v.widgets.open, ACCENT_SOFT, ACCENT, STROKE_NORMAL),
+    ] {
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = Stroke::new(width, border);
+        w.fg_stroke = Stroke::new(STROKE_NORMAL, TEXT);
+        w.corner_radius = CornerRadius::same(CONTROL_RADIUS);
+        w.expansion = 0.0;
+    }
+    s.visuals = v;
+    s
+}
+
+/// A white card with a section title, used for each settings group.
+fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(STROKE_NORMAL, BORDER))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(Margin::same(CARD_PADDING))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(title).size(FONT_SECTION).strong());
+            ui.add_space(SPACE_FIELD - SPACE_LABEL);
+            body(ui);
+        });
+}
+
+/// Filled accent Save button, drawn in the footer.
+fn primary_save(ui: &mut egui::Ui) -> egui::Response {
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        for (w, fill, width) in [
+            (&mut v.widgets.inactive, ACCENT, STROKE_NORMAL),
+            (&mut v.widgets.hovered, ACCENT_HOVER, STROKE_NORMAL),
+            (&mut v.widgets.active, ACCENT_ACTIVE, STROKE_FOCUS),
+        ] {
+            w.bg_fill = fill;
+            w.weak_bg_fill = fill;
+            w.fg_stroke = Stroke::new(STROKE_NORMAL, ON_ACCENT);
+            w.bg_stroke = Stroke::new(width, ACCENT_ACTIVE);
+        }
+        ui.add_sized(ACTION_SIZE, egui::Button::new("Save"))
+    })
+    .inner
+}
+
+/// One stacked field: a visible label above a full-width single-line
+/// edit. `mask` renders the text as a password. Returns the edit's
+/// response so callers can attach tooltips.
+fn field_edit(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: &str,
+    value: &mut String,
+    hint: &str,
+    mask: bool,
+) -> egui::Response {
+    let lbl = ui.label(label);
+    let mut edit = egui::TextEdit::singleline(value)
+        .id_salt(id)
+        .desired_width(f32::INFINITY);
+    if !hint.is_empty() {
+        edit = edit.hint_text(hint);
+    }
+    if mask {
+        edit = edit.password(true);
+    }
+    let response = ui
+        .add_sized([ui.available_width(), CONTROL_HEIGHT], edit)
+        .labelled_by(lbl.id);
+    ui.add_space(SPACE_FIELD - SPACE_LABEL);
+    response
+}
+
+/// One stacked numeric field: label above a fixed-width DragValue.
+fn field_drag(ui: &mut egui::Ui, label: &str, drag: egui::DragValue) -> egui::Response {
+    let lbl = ui.label(label);
+    let response = ui
+        .add_sized([NUMERIC_WIDTH, CONTROL_HEIGHT], drag)
+        .labelled_by(lbl.id);
+    ui.add_space(SPACE_FIELD - SPACE_LABEL);
+    response
+}
+
 /// Open the settings window for `config_path`. Loads any existing config
 /// to pre-fill the form; falls back to template defaults otherwise.
 /// Blocks the calling thread for the lifetime of the window.
@@ -47,7 +235,7 @@ pub fn run(config_path: PathBuf) -> Result<()> {
     let app = SettingsApp::new(config_path, initial, saved.clone());
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([520.0, 360.0])
+        .with_inner_size([640.0, 720.0])
         .with_min_inner_size([420.0, 320.0])
         .with_resizable(true)
         .with_title(WINDOW_TITLE)
@@ -368,16 +556,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// not say *what* is lazy, and the difference only shows up minutes later when
 /// a peer pastes.
 fn send_mode_combo(ui: &mut egui::Ui, value: &mut SendMode) {
+    let field_label = ui.label("Send files");
     let label = match value {
         SendMode::Eager => "Eager (send immediately)",
         SendMode::Lazy => "Lazy (let peers pull on paste)",
     };
     egui::ComboBox::from_id_salt("send_mode")
+        .width(ui.available_width())
         .selected_text(label)
         .show_ui(ui, |ui| {
             ui.selectable_value(value, SendMode::Eager, "Eager (send immediately)");
             ui.selectable_value(value, SendMode::Lazy, "Lazy (let peers pull on paste)");
-        });
+        })
+        .response
+        .labelled_by(field_label.id);
+    ui.add_space(SPACE_FIELD - SPACE_LABEL);
 }
 
 /// Receive-mode dropdown.
@@ -386,6 +579,7 @@ fn send_mode_combo(ui: &mut egui::Ui, value: &mut SendMode) {
 /// time. The alternative — offer it and refuse the save — makes the user fill
 /// in the whole form before learning the choice was never possible.
 fn receive_mode_combo(ui: &mut egui::Ui, value: &mut ReceiveMode) {
+    let field_label = ui.label("Receive files");
     let label = |mode: ReceiveMode| match mode {
         ReceiveMode::Eager => "Eager (as before)",
         ReceiveMode::Auto => "Auto (by platform)",
@@ -393,6 +587,7 @@ fn receive_mode_combo(ui: &mut egui::Ui, value: &mut ReceiveMode) {
         ReceiveMode::Paste => "Paste (platform clipboard)",
     };
     egui::ComboBox::from_id_salt("receive_mode")
+        .width(ui.available_width())
         .selected_text(label(*value))
         .show_ui(ui, |ui| {
             for mode in [
@@ -405,6 +600,8 @@ fn receive_mode_combo(ui: &mut egui::Ui, value: &mut ReceiveMode) {
                     // Disabled with the reason in the tooltip; still rendered
                     // so the option is visibly *not available* rather than
                     // silently absent, which reads like a bug.
+                    let reason = "Paste needs a platform clipboard that can materialise \
+                                  a pull at paste time (Phase 0 spike). Use Pickup instead.";
                     ui.add_enabled(
                         false,
                         egui::Label::new(
@@ -414,17 +611,19 @@ fn receive_mode_combo(ui: &mut egui::Ui, value: &mut ReceiveMode) {
                                 std::env::consts::OS
                             ))
                             .weak(),
-                        ),
+                        )
+                        .wrap(),
                     )
-                    .on_hover_text(
-                        "Paste needs a platform clipboard that can materialise a pull at \
-                         paste time (Phase 0 spike). Use Pickup instead.",
-                    );
+                    .on_hover_text(reason)
+                    .on_disabled_hover_text(reason);
                     continue;
                 }
                 ui.selectable_value(value, mode, label(mode));
             }
-        });
+        })
+        .response
+        .labelled_by(field_label.id);
+    ui.add_space(SPACE_FIELD - SPACE_LABEL);
 }
 
 impl eframe::App for SettingsApp {
@@ -439,198 +638,281 @@ impl SettingsApp {
     /// [`egui_kittest::Harness`] without constructing an `eframe::Frame`
     /// (which has no public constructor).
     fn draw(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("clipboardwire client settings");
-            ui.add_space(8.0);
-            ui.label(format!("File: {}", self.config_path.display()));
-            ui.separator();
+        ctx.set_style(settings_style());
 
-            egui::Grid::new("settings_grid")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Server URL");
-                    ui.text_edit_singleline(&mut self.form.server)
-                        .on_hover_text("ws://host:8484/sync or wss://host:8484/sync");
-                    ui.end_row();
+        egui::TopBottomPanel::top("settings_header")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(PAGE)
+                    .inner_margin(Margin::symmetric(PAGE_MARGIN, BAR_PADDING_Y)),
+            )
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("clipboardwire").small().color(MUTED));
+                ui.heading("Settings");
+                let path = format!("File: {}", self.config_path.display());
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&path).small().color(MUTED)).truncate(),
+                )
+                .on_hover_text(path);
+            });
 
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut self.form.user);
-                    ui.end_row();
-
-                    ui.label("Password");
-                    ui.horizontal(|ui| {
-                        let pw_field = if self.show_password {
-                            egui::TextEdit::singleline(&mut self.form.password)
-                        } else {
-                            egui::TextEdit::singleline(&mut self.form.password).password(true)
-                        };
-                        ui.add(pw_field);
-                        ui.checkbox(&mut self.show_password, "show");
-                    });
-                    ui.end_row();
-
-                    ui.label("Poll interval (ms)");
-                    ui.add(egui::DragValue::new(&mut self.form.poll_ms).range(50..=10_000));
-                    ui.end_row();
-
-                    ui.label("TLS CA file (optional)");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.form.tls_ca_file)
-                            .on_hover_text("PEM file with extra root CAs to trust");
-                        if ui
-                            .button("Pin from server")
-                            .on_hover_text(
-                                "Connect to the server URL, fetch its certificate, save it next \
-                                 to the config file, and point this field at the saved PEM. \
-                                 You no longer need `Skip TLS verification` after pinning.",
-                            )
-                            .clicked()
-                        {
-                            self.pin_server_cert();
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Skip TLS verification");
-                    ui.add(egui::Checkbox::new(
-                        &mut self.form.tls_insecure,
-                        "DANGEROUS — LAN/VPN only",
-                    ));
-                    ui.end_row();
-
-                    ui.label("Log file names");
-                    ui.add(egui::Checkbox::new(
-                        &mut self.form.log_file_names,
-                        "Write real names to the log (default: pseudonyms)",
-                    ))
-                    .on_hover_text(
-                        "Off by default: INFO and above carry `file#<hex>` instead of the real \
-                         name, so a log does not become a record of everything copied. Turn this \
-                         on only while debugging a specific transfer.",
-                    );
-                    ui.end_row();
-
-                    ui.label("Send files");
-                    send_mode_combo(ui, &mut self.form.send_mode);
-                    ui.end_row();
-
-                    ui.label("Receive files");
-                    receive_mode_combo(ui, &mut self.form.receive_mode);
-                    ui.end_row();
+        let mut save = false;
+        let mut cancel = false;
+        egui::TopBottomPanel::bottom("settings_footer")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .inner_margin(Margin::symmetric(PAGE_MARGIN, BAR_PADDING_Y)),
+            )
+            .show(ctx, |ui| {
+                // `last_error` carries both validation failures and pin
+                // feedback, so present it as a neutral status, not "Error".
+                if let Some(message) = &self.form.last_error {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_status_scroll")
+                        .max_height(STATUS_MAX_HEIGHT)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Frame::new()
+                                .fill(FIELD)
+                                .inner_margin(Margin::same(8))
+                                .corner_radius(CornerRadius::same(CONTROL_RADIUS))
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Status").small().color(MUTED));
+                                    ui.add(egui::Label::new(message).wrap());
+                                });
+                        });
+                    ui.add_space(SPACE_INLINE - SPACE_LABEL);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    save = primary_save(ui).clicked();
+                    cancel = ui
+                        .add_sized(ACTION_SIZE, egui::Button::new("Cancel"))
+                        .clicked();
                 });
+            });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.collapsing("Run hub on this machine", |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(PAGE)
+                    .inner_margin(Margin::same(PAGE_MARGIN)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_body_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.push_id("connection", |ui| {
+                            card(ui, "Connection", |ui| {
+                                if self.form.hub_enabled {
+                                    ui.label(
+                                        "The local client joins the embedded hub over \
+                                         loopback — server URL, TLS and credentials all \
+                                         come from the hub settings under Advanced.",
+                                    );
+                                } else {
+                                    self.draw_connection(ui);
+                                }
+                            })
+                        });
+                        if !self.form.hub_enabled {
+                            ui.add_space(SPACE_CARD - SPACE_LABEL);
+                            ui.push_id("security", |ui| {
+                                card(ui, "Security", |ui| self.draw_security(ui))
+                            });
+                        }
+                        ui.add_space(SPACE_CARD - SPACE_LABEL);
+                        ui.push_id("transfer", |ui| {
+                            card(ui, "Transfer", |ui| self.draw_transfer(ui))
+                        });
+                        ui.add_space(SPACE_CARD - SPACE_LABEL);
+                        ui.push_id("advanced", |ui| {
+                            card(ui, "Advanced", |ui| self.draw_advanced(ui))
+                        });
+                    });
+            });
+
+        // Process actions after drawing the body so this frame's edits are used.
+        if save {
+            if self.try_save() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+        }
+        if cancel {
+            self.saved.store(false, Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn draw_connection(&mut self, ui: &mut egui::Ui) {
+        field_edit(
+            ui,
+            "Server URL",
+            "server",
+            &mut self.form.server,
+            "wss://host:8484/sync",
+            false,
+        )
+        .on_hover_text("ws://host:8484/sync or wss://host:8484/sync");
+        field_edit(ui, "Username", "user", &mut self.form.user, "", false);
+        field_edit(
+            ui,
+            "Password",
+            "password",
+            &mut self.form.password,
+            "",
+            !self.show_password,
+        );
+        ui.checkbox(&mut self.show_password, "show");
+    }
+
+    fn draw_security(&mut self, ui: &mut egui::Ui) {
+        field_edit(
+            ui,
+            "TLS CA file (optional)",
+            "tls_ca_file",
+            &mut self.form.tls_ca_file,
+            "",
+            false,
+        )
+        .on_hover_text("PEM file with extra root CAs to trust");
+        if ui
+            .button("Pin from server")
+            .on_hover_text(
+                "Connect to the server URL, fetch its certificate, save it next \
+                 to the config file, and point this field at the saved PEM. \
+                 You no longer need `Skip TLS verification` after pinning.",
+            )
+            .clicked()
+        {
+            self.pin_server_cert();
+        }
+        ui.add_space(SPACE_FIELD - SPACE_LABEL);
+        ui.label("Skip TLS verification");
+        ui.checkbox(
+            &mut self.form.tls_insecure,
+            egui::RichText::new("DANGEROUS — LAN/VPN only").color(WARNING),
+        );
+    }
+
+    fn draw_transfer(&mut self, ui: &mut egui::Ui) {
+        send_mode_combo(ui, &mut self.form.send_mode);
+        receive_mode_combo(ui, &mut self.form.receive_mode);
+        field_drag(
+            ui,
+            "Poll interval (ms)",
+            egui::DragValue::new(&mut self.form.poll_ms).range(50..=10_000),
+        );
+    }
+
+    fn draw_advanced(&mut self, ui: &mut egui::Ui) {
+        ui.label("Log file names");
+        ui.checkbox(
+            &mut self.form.log_file_names,
+            "Write real names to the log (default: pseudonyms)",
+        )
+        .on_hover_text(
+            "Off by default: INFO and above carry `file#<hex>` instead of the real \
+             name, so a log does not become a record of everything copied. Turn this \
+             on only while debugging a specific transfer.",
+        );
+        ui.add_space(SPACE_FIELD - SPACE_LABEL);
+
+        egui::CollapsingHeader::new("Run hub on this machine")
+            .id_salt("hub_settings")
+            // Hub creds are the only credentials in hub mode — surface
+            // them instead of burying them under a closed header.
+            .default_open(self.form.hub_enabled)
+            .show(ui, |ui| {
                 ui.label(
                     "Bring up a clipboard-sync hub server in the tray process. \
                      The local client will connect to it over loopback; other \
                      devices on your network connect to the address below.",
                 );
-                ui.add_space(4.0);
+                ui.add_space(SPACE_LABEL);
                 ui.checkbox(&mut self.form.hub_enabled, "Run hub when the tray starts");
+                ui.add_space(SPACE_FIELD - SPACE_LABEL);
                 ui.add_enabled_ui(self.form.hub_enabled, |ui| {
-                    egui::Grid::new("hub_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Bind");
-                            ui.text_edit_singleline(&mut self.form.hub_bind)
-                                .on_hover_text("host:port, e.g. 0.0.0.0:8484");
-                            ui.end_row();
-
-                            ui.label("Hub username");
-                            ui.text_edit_singleline(&mut self.form.hub_user);
-                            ui.end_row();
-
-                            ui.label("Hub password");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.form.hub_password)
-                                    .password(!self.show_password),
-                            );
-                            ui.end_row();
-
-                            ui.label("TLS cert file");
-                            ui.text_edit_singleline(&mut self.form.hub_tls_cert_file)
-                                .on_hover_text("PEM. Leave empty to speak plain ws://.");
-                            ui.end_row();
-
-                            ui.label("TLS key file");
-                            ui.text_edit_singleline(&mut self.form.hub_tls_key_file)
-                                .on_hover_text("PEM. Required iff cert file is set.");
-                            ui.end_row();
-                        });
+                    field_edit(ui, "Bind", "hub_bind", &mut self.form.hub_bind, "", false)
+                        .on_hover_text("host:port, e.g. 0.0.0.0:8484");
+                    field_edit(
+                        ui,
+                        "Hub username",
+                        "hub_user",
+                        &mut self.form.hub_user,
+                        "",
+                        false,
+                    );
+                    field_edit(
+                        ui,
+                        "Hub password",
+                        "hub_password",
+                        &mut self.form.hub_password,
+                        "",
+                        !self.show_password,
+                    );
+                    // The Connection "show" toggle is hidden in hub mode;
+                    // keep a way to unmask the one password still editable.
+                    ui.checkbox(&mut self.show_password, "show");
+                    field_edit(
+                        ui,
+                        "TLS cert file",
+                        "hub_tls_cert_file",
+                        &mut self.form.hub_tls_cert_file,
+                        "",
+                        false,
+                    )
+                    .on_hover_text("PEM. Leave empty to speak plain ws://.");
+                    field_edit(
+                        ui,
+                        "TLS key file",
+                        "hub_tls_key_file",
+                        &mut self.form.hub_tls_key_file,
+                        "",
+                        false,
+                    )
+                    .on_hover_text("PEM. Required iff cert file is set.");
                 });
             });
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.collapsing("Lazy transfer tuning", |ui| {
+        egui::CollapsingHeader::new("Lazy transfer tuning")
+            .id_salt("lazy_transfer_tuning")
+            .default_open(false)
+            .show(ui, |ui| {
                 ui.label(
                     "Only meaningful once lazy transfer ships. The defaults are what a \
                      config without these keys gets.",
                 );
-                ui.add_space(4.0);
-                egui::Grid::new("transfer_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Retrieve without a tray");
-                        ui.add(egui::Checkbox::new(
-                            &mut self.form.pickup_auto,
-                            "Headless receivers fetch offers automatically",
-                        ));
-                        ui.end_row();
-
-                        ui.label("Offer TTL (minutes)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.form.offer_ttl_minutes).range(1..=1440),
-                        )
-                        .on_hover_text("How long a published offer stays pullable.");
-                        ui.end_row();
-
-                        ui.label("Chunks per pull");
-                        ui.add(
-                            egui::DragValue::new(&mut self.form.pull_window_chunks).range(1..=32),
-                        )
-                        .on_hover_text("How many 4 MiB chunks one `file_pull` asks for.");
-                        ui.end_row();
-
-                        ui.label("Pull idle timeout (s)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.form.pull_idle_timeout_secs)
-                                .range(1..=3600),
-                        )
-                        .on_hover_text("Give up on a pull that stops making progress.");
-                        ui.end_row();
-                    });
+                ui.add_space(SPACE_LABEL);
+                ui.label("Retrieve without a tray");
+                ui.checkbox(
+                    &mut self.form.pickup_auto,
+                    "Headless receivers fetch offers automatically",
+                );
+                ui.add_space(SPACE_FIELD - SPACE_LABEL);
+                field_drag(
+                    ui,
+                    "Offer TTL (minutes)",
+                    egui::DragValue::new(&mut self.form.offer_ttl_minutes).range(1..=1440),
+                )
+                .on_hover_text("How long a published offer stays pullable.");
+                field_drag(
+                    ui,
+                    "Chunks per pull",
+                    egui::DragValue::new(&mut self.form.pull_window_chunks).range(1..=32),
+                )
+                .on_hover_text("How many 4 MiB chunks one `file_pull` asks for.");
+                field_drag(
+                    ui,
+                    "Pull idle timeout (s)",
+                    egui::DragValue::new(&mut self.form.pull_idle_timeout_secs).range(1..=3600),
+                )
+                .on_hover_text("Give up on a pull that stops making progress.");
             });
-
-            ui.add_space(12.0);
-
-            if let Some(err) = &self.form.last_error {
-                ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
-                ui.add_space(8.0);
-            }
-
-            ui.horizontal(|ui| {
-                let save = ui
-                    .add_sized([100.0, 28.0], egui::Button::new("Save"))
-                    .clicked();
-                let cancel = ui
-                    .add_sized([100.0, 28.0], egui::Button::new("Cancel"))
-                    .clicked();
-
-                if save && self.try_save() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if cancel {
-                    self.saved.store(false, Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
     }
 }
 
@@ -671,14 +953,19 @@ fn paste_supported() -> bool {
 
 /// Validate the form. Returns a human-readable error string on failure.
 fn validate(form: &FormState) -> std::result::Result<(), String> {
-    if !form.server.starts_with("ws://") && !form.server.starts_with("wss://") {
-        return Err("Server URL must start with ws:// or wss://".into());
-    }
-    if form.user.trim().is_empty() {
-        return Err("Username must not be empty".into());
-    }
-    if form.password.is_empty() {
-        return Err("Password must not be empty".into());
+    // With the embedded hub enabled the connection fields are derived
+    // from the hub section at write time (loopback URL + hub creds),
+    // so only the hub inputs themselves need checking here.
+    if !form.hub_enabled {
+        if !form.server.starts_with("ws://") && !form.server.starts_with("wss://") {
+            return Err("Server URL must start with ws:// or wss://".into());
+        }
+        if form.user.trim().is_empty() {
+            return Err("Username must not be empty".into());
+        }
+        if form.password.is_empty() {
+            return Err("Password must not be empty".into());
+        }
     }
     if form.poll_ms == 0 {
         return Err("Poll interval must be at least 1 ms".into());
@@ -713,13 +1000,24 @@ fn validate(form: &FormState) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The `server` URL written when the hub is enabled: the same loopback
+/// address the tray derives at runtime (`point_client_at_hub`). The form
+/// never exposes `hub.tls_disabled`, so the hub always speaks `wss`.
+fn loopback_url(bind: &str) -> String {
+    let port = bind
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.port())
+        .unwrap_or(8484);
+    format!("wss://127.0.0.1:{port}/sync")
+}
+
 /// Serializable shadow of the writable fields. We don't serialize
 /// `last_error` or the password-toggle state — those are UI-only.
 #[derive(serde::Serialize)]
 struct WritableConfig<'a> {
-    server: &'a str,
-    user: &'a str,
-    password: &'a str,
+    server: std::borrow::Cow<'a, str>,
+    user: std::borrow::Cow<'a, str>,
+    password: std::borrow::Cow<'a, str>,
     poll_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tls_ca_file: Option<&'a str>,
@@ -773,10 +1071,27 @@ fn is_false(b: &bool) -> bool {
 /// form field → config key mapping lives.
 fn writable_config<'a>(form: &'a FormState, hub: Option<WritableHub<'a>>) -> WritableConfig<'a> {
     let ca = form.tls_ca_file.trim();
+    // Hub mode hides the connection fields: the runtime overwrites the
+    // client URL with the loopback hop and the loopback client must
+    // present the hub's credentials, so the file writes the same
+    // derivation instead of keeping stale hidden values.
+    let (server, user, password) = if form.hub_enabled {
+        (
+            std::borrow::Cow::Owned(loopback_url(&form.hub_bind)),
+            std::borrow::Cow::Borrowed(form.hub_user.as_str()),
+            std::borrow::Cow::Borrowed(form.hub_password.as_str()),
+        )
+    } else {
+        (
+            std::borrow::Cow::Borrowed(form.server.as_str()),
+            std::borrow::Cow::Borrowed(form.user.as_str()),
+            std::borrow::Cow::Borrowed(form.password.as_str()),
+        )
+    };
     WritableConfig {
-        server: &form.server,
-        user: &form.user,
-        password: &form.password,
+        server,
+        user,
+        password,
         poll_ms: form.poll_ms,
         tls_ca_file: if ca.is_empty() { None } else { Some(ca) },
         tls_insecure: form.tls_insecure,
@@ -847,6 +1162,18 @@ fn write_toml(path: &Path, form: &FormState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A form with the embedded hub enabled: the only credentials the
+    /// user needs are the hub's — the client fields are hidden and
+    /// re-derived at write time.
+    fn hub_form() -> FormState {
+        let mut form = valid_form();
+        form.hub_enabled = true;
+        form.hub_bind = "0.0.0.0:8484".into();
+        form.hub_user = "hubadmin".into();
+        form.hub_password = "hubsecret".into();
+        form
+    }
 
     fn valid_form() -> FormState {
         FormState {
@@ -1004,6 +1331,65 @@ mod tests {
         assert!(reloaded.log_file_names);
         assert_eq!(reloaded.send_mode, SendMode::Lazy);
         assert!(reloaded.pickup_auto);
+    }
+
+    #[test]
+    fn hub_mode_accepts_empty_client_fields_and_derives_them() {
+        // With the hub on, the client connection inputs are hidden, so
+        // the user must be able to save with them empty — the values
+        // land in the file derived from the hub section instead.
+        let mut form = hub_form();
+        form.server.clear();
+        form.user.clear();
+        form.password.clear();
+        assert!(validate(&form).is_ok(), "hub mode must skip client checks");
+
+        // `rendered` serializes without a hub section, so build the same
+        // hub block `write_toml` would to exercise the real output.
+        let hub = WritableHub {
+            enabled: true,
+            bind: form.hub_bind.clone(),
+            user: &form.hub_user,
+            password: &form.hub_password,
+            tls_cert_file: None,
+            tls_key_file: None,
+        };
+        let out = toml::to_string(&writable_config(&form, Some(hub))).expect("serialize");
+        assert!(
+            out.contains("server = \"wss://127.0.0.1:8484/sync\""),
+            "{out}"
+        );
+        assert!(out.contains("user = \"hubadmin\""), "{out}");
+        assert!(out.contains("password = \"hubsecret\""), "{out}");
+        let reread: ClientConfig = toml::from_str(&out).unwrap();
+        assert_eq!(reread.user, "hubadmin");
+        assert_eq!(reread.hub.expect("hub section").bind.port(), 8484);
+    }
+
+    #[test]
+    fn hub_mode_still_requires_hub_credentials() {
+        let mut form = hub_form();
+        form.hub_user.clear();
+        assert!(validate(&form).is_err());
+        let mut form = hub_form();
+        form.hub_password.clear();
+        assert!(validate(&form).is_err());
+        let mut form = hub_form();
+        form.hub_bind = "not-an-addr".into();
+        assert!(validate(&form).is_err());
+    }
+
+    #[test]
+    fn client_fields_still_required_without_hub() {
+        let mut form = valid_form();
+        form.server.clear();
+        assert!(validate(&form).is_err());
+        let mut form = valid_form();
+        form.user.clear();
+        assert!(validate(&form).is_err());
+        let mut form = valid_form();
+        form.password.clear();
+        assert!(validate(&form).is_err());
     }
 
     #[test]
@@ -1267,5 +1653,43 @@ mod tests {
         assert!(!path.exists(), "validation failure should not write file");
         // The error message we render for empty user starts with this prefix.
         harness.get_by_label_contains("Username must not be empty");
+    }
+
+    #[test]
+    fn hub_mode_hides_client_connection_fields() {
+        // With the hub enabled the client connection inputs are
+        // replaced by a note — nothing labelled Server URL / Username /
+        // TLS CA may still be on screen.
+        let path = unique_dir("hubui").join("config.toml");
+        let saved = Arc::new(AtomicBool::new(false));
+        let mut harness = build_harness(path, hub_form(), saved);
+        harness.run();
+
+        for hidden in ["Server URL", "Username", "TLS CA file (optional)"] {
+            assert!(
+                harness.query_all_by_label(hidden).next().is_none(),
+                "{hidden} should be hidden in hub mode"
+            );
+        }
+        // The hub disclosure header is the visible entry point instead.
+        harness.get_by_label("Run hub on this machine");
+    }
+
+    #[test]
+    fn footer_actions_reachable_at_min_window_size() {
+        // The fixed footer keeps Save/Cancel off the scrollable form, so they
+        // must be queryable at the 420×320 minimum without scrolling.
+        let path = unique_dir("minsize").join("config.toml");
+        let saved = Arc::new(AtomicBool::new(false));
+        let app = SettingsApp::new(path, valid_form(), saved);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(420.0, 320.0))
+            .build_state(|ctx, app: &mut SettingsApp| app.draw(ctx), app);
+        harness.run();
+
+        harness.get_by_label("Save");
+        harness.get_by_label("Cancel");
+        harness.get_by_label("Server URL");
+        harness.get_by_label("Username");
     }
 }
