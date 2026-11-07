@@ -4,6 +4,38 @@ All notable changes to clipboardwire are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.5.6] — 2026-11-07
+
+### Fixed — first copy after a reconnect no longer gets overwritten
+
+"Copy a file, paste, nothing; copy it again, paste works" traced to
+inbound writes trampling a fresh local copy around every reconnect:
+
+- `welcome.last_clip` was applied unconditionally on every reconnect —
+  including replays of the clip this machine itself published.
+- `welcome.offers` replays every live offer, the registering device's
+  included; on paste-mode receivers that armed an OLE promise (or
+  auto-pulled) for a file the user themselves had copied.
+- The first poll of a restarted clipboard thread republished the
+  pre-existing clipboard to every peer, overwriting theirs.
+
+Now the clipboard thread seeds its trackers at startup instead of
+publishing, flushes a pending local change before judging an inbound
+apply, keeps the clipboard for `LOCAL_COPY_GRACE` (5s) after a local
+copy, skips no-op applies of content already present, and retries
+writes that lose the `OpenClipboard` race (Explorer mid-copy). The
+supervisor defers the OLE promise arm and the received-files batch
+inside the same window, ignores replayed offers owned by this device,
+and pauses pull-restart bookkeeping while disconnected so a flap
+storm can't burn the restart budget.
+
+### Added
+
+- Settings UI redesign: card layout on a light slate theme, and the
+  Connection/Security cards collapse into a note when `[hub].enabled`
+  — the client joins the embedded hub over loopback, so those fields
+  are derived rather than edited.
+
 ## [0.5.5] — 2026-11-03
 
 Lazy file transfer (protocol v0.4) and paste-on-demand receiving are live.
