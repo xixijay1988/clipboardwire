@@ -101,6 +101,13 @@ pub struct Transport {
     /// per copy rather than caching it, so it always gates on the connection
     /// that is actually live.
     pub hub_caps: watch::Receiver<Option<Caps>>,
+    /// `true` between a completed `welcome` and the next disconnect.
+    ///
+    /// `hub_caps` cannot answer this: its last value survives a dropped
+    /// socket by design. The supervisor uses it to tell "transfer is
+    /// stalling" from "there is no connection at all" — the second case
+    /// must not burn the pull restart budget.
+    pub connected: watch::Receiver<bool>,
 }
 
 impl Transport {
@@ -131,6 +138,7 @@ impl Transport {
             inbound_control_rx,
             outbound_control_tx,
             hub_caps,
+            connected,
         } = self;
         // Explicit, one statement per channel: a reader has to be able to see
         // that every sender really dies here.
@@ -141,6 +149,7 @@ impl Transport {
         drop(inbound_files_rx);
         drop(inbound_control_rx);
         drop(hub_caps);
+        drop(connected);
 
         join.await
             .map_err(|e| anyhow!("transport task panicked: {e}"))?;
@@ -223,6 +232,7 @@ pub fn spawn_with_options(
     // a sender that copies a file before the handshake completes must not
     // assume the hub understands offers.
     let (hub_caps_tx, hub_caps_rx) = watch::channel(None);
+    let (connected_tx, connected_rx) = watch::channel(false);
     let SpawnOptions {
         status_tx,
         one_shot,
@@ -245,6 +255,7 @@ pub fn spawn_with_options(
             links,
             status_tx,
             hub_caps_tx,
+            connected_tx,
             one_shot,
         )
         .await;
@@ -258,6 +269,7 @@ pub fn spawn_with_options(
             inbound_control_rx,
             outbound_control_tx,
             hub_caps: hub_caps_rx,
+            connected: connected_rx,
         },
         join,
     )
@@ -293,6 +305,7 @@ async fn run_loop(
     mut links: Links,
     status_tx: Option<watch::Sender<ClientStatus>>,
     hub_caps_tx: watch::Sender<Option<Caps>>,
+    connected_tx: watch::Sender<bool>,
     one_shot: bool,
 ) {
     let emit = |s: ClientStatus| {
@@ -306,8 +319,16 @@ async fn run_loop(
     loop {
         emit(ClientStatus::Connecting);
         let attempt_start = Instant::now();
-        let outcome =
-            connect_and_serve(&config, wire, &mut links, status_tx.as_ref(), &hub_caps_tx).await;
+        let outcome = connect_and_serve(
+            &config,
+            wire,
+            &mut links,
+            status_tx.as_ref(),
+            &hub_caps_tx,
+            &connected_tx,
+        )
+        .await;
+        let _ = connected_tx.send(false);
         match &outcome {
             Ok(()) => debug!("connection ended cleanly"),
             Err(e) => warn!(error = %format!("{e:#}"), "connection error"),
@@ -485,6 +506,7 @@ async fn connect_and_serve(
     links: &mut Links,
     status_tx: Option<&watch::Sender<ClientStatus>>,
     hub_caps_tx: &watch::Sender<Option<Caps>>,
+    connected_tx: &watch::Sender<bool>,
 ) -> Result<()> {
     let url = upgrade_url(&config.server, wire.device, wire.caps);
     let mut req = url
@@ -571,6 +593,10 @@ async fn connect_and_serve(
     if let Some(clip) = welcome.last_clip {
         let _ = links.inbound_tx.send(clip).await;
     }
+
+    // Welcome consumed: the connection is usable. `run_loop` drops this
+    // back to `false` the moment `connect_and_serve` returns.
+    let _ = connected_tx.send(true);
 
     let mut ping_timer = tokio::time::interval(PING_INTERVAL);
     ping_timer.tick().await; // skip the immediate first tick

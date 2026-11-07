@@ -712,6 +712,7 @@ async fn a_lazy_transfer_crosses_a_real_hub_byte_exactly() {
             pull_window_chunks: 2,
             save_dir: Some(recv_dir.clone()),
         },
+        None,
     ));
     wait_connected(&mut recv_status_rx).await;
 
@@ -753,6 +754,7 @@ async fn a_lazy_transfer_crosses_a_real_hub_byte_exactly() {
             mode: ReceiveMode::Eager,
             ..ReceivePolicy::default()
         },
+        None,
     ));
     wait_connected(&mut send_status_rx).await;
 

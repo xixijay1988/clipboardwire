@@ -232,6 +232,7 @@ fn child_body() {
                 pull_window_chunks: 2,
                 save_dir: None,
             },
+            None,
         ));
         wait_connected(&mut recv_status_rx).await;
 
@@ -268,6 +269,7 @@ fn child_body() {
                 mode: ReceiveMode::Eager,
                 ..ReceivePolicy::default()
             },
+            None,
         ));
         wait_connected(&mut send_status_rx).await;
         tokio::time::sleep(Duration::from_millis(100)).await;

@@ -118,6 +118,7 @@ async fn offer_published_before_receiver_joins_still_lands() {
             mode: ReceiveMode::Eager,
             ..ReceivePolicy::default()
         },
+        None,
     ));
     wait_connected(&mut send_status_rx).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -166,6 +167,7 @@ async fn offer_published_before_receiver_joins_still_lands() {
             pull_window_chunks: 2,
             save_dir: Some(recv_dir.clone()),
         },
+        None,
     ));
     wait_connected(&mut recv_status_rx).await;
 
@@ -236,6 +238,13 @@ struct MockWire {
 }
 
 fn mock_supervisor(recv_dir: PathBuf) -> (MockWire, tokio::task::JoinHandle<()>) {
+    mock_supervisor_with(recv_dir, None)
+}
+
+fn mock_supervisor_with(
+    recv_dir: PathBuf,
+    self_device: Option<Uuid>,
+) -> (MockWire, tokio::task::JoinHandle<()>) {
     let (events_tx, events_rx) = mpsc::channel::<ClipChange>(8);
     let (apply_tx, _apply_rx) = std::sync::mpsc::channel::<ClipChange>();
     let (outbound_tx, outbound_rx) = mpsc::channel::<ClipFrame>(8);
@@ -245,6 +254,7 @@ fn mock_supervisor(recv_dir: PathBuf) -> (MockWire, tokio::task::JoinHandle<()>)
     let (inbound_control_tx, inbound_control_rx) = mpsc::channel::<Frame>(8);
     let (inbound_files_tx, inbound_files_rx) = mpsc::channel::<FileChunkFrame>(8);
     let (hub_caps_tx, hub_caps) = watch::channel(Some(Caps::LAZY_FILE));
+    let (_connected_tx, connected) = watch::channel(true);
 
     let transport = Transport {
         inbound_rx,
@@ -254,6 +264,7 @@ fn mock_supervisor(recv_dir: PathBuf) -> (MockWire, tokio::task::JoinHandle<()>)
         inbound_control_rx: Some(inbound_control_rx),
         outbound_control_tx,
         hub_caps,
+        connected,
     };
     let save_dir = recv_dir.clone();
     let join = tokio::spawn(run_supervisor_with_policy(
@@ -274,6 +285,7 @@ fn mock_supervisor(recv_dir: PathBuf) -> (MockWire, tokio::task::JoinHandle<()>)
             pull_window_chunks: 1,
             save_dir: Some(save_dir),
         },
+        self_device,
     ));
     (
         MockWire {
@@ -530,6 +542,46 @@ async fn a_digest_that_overtakes_the_last_chunk_still_completes() {
         assert!(std::time::Instant::now() <= deadline, "file never landed");
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+
+    drop(wire.events_tx);
+    drop(wire.inbound_control_tx);
+    join.abort();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `welcome.offers` replays *every* live offer — the hub does not exclude
+/// the registering device, so our own advertisements come back at us on
+/// every reconnect. Acting on one (arming a promise, or auto-pulling it
+/// in pickup mode) replaces the local clipboard with a self-reference —
+/// or spools a pointless self-transfer. The supervisor must ignore an
+/// offer whose `from_device` is us.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_we_published_is_never_pulled() {
+    let dir = unique_dir("own-offer");
+    let us = Uuid::new_v4();
+    let (mut wire, join) = mock_supervisor_with(dir.clone(), Some(us));
+
+    // Our own offer is ignored entirely: no pull, no abort, nothing.
+    wire.inbound_control_tx
+        .send(offer(Uuid::new_v4(), us, 64))
+        .await
+        .unwrap();
+
+    // A foreign offer right behind it proves the channel is live and
+    // produces exactly one pull — any second frame would be our own
+    // offer leaking through.
+    wire.inbound_control_tx
+        .send(offer(Uuid::new_v4(), Uuid::new_v4(), 64))
+        .await
+        .unwrap();
+    let _p = next_pull(&mut wire.outbound_control_rx, "foreign offer").await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), wire.outbound_control_rx.recv())
+            .await
+            .is_err(),
+        "an offer owned by this device produced outbound traffic"
+    );
 
     drop(wire.events_tx);
     drop(wire.inbound_control_tx);

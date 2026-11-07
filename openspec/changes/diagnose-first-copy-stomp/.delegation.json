@@ -1,0 +1,21 @@
+{
+  "round": 1,
+  "total_rounds": 3,
+  "pending_operation": null,
+  "last_result": "xs-office log+config diagnostic: stomp confirmed; flapping peer .19 + inbound writes + dead-pull renders",
+  "next_action": "awaiting-user-decision-on-fix",
+  "hypotheses": [
+    "H1 welcome-replay stomp: every reconnect applies welcome.last_clip + replays welcome.offers (incl. own offers -> paste-mode arm) -> overwrites the user's just-copied clipboard",
+    "H2 inbound stomp: peer clip broadcast / pickup batch apply / paste-mode arm lands just after a local copy and rewrites the local clipboard",
+    "H3 send-side swallow: first copy's frame dropped in the reconnect gap (outbound closed / events channel full) and dedup then suppresses re-publish",
+    "H4 promise-render failure: clipboard holds armed promise; local copy replaced by a later arm; Ctrl+V pulls/fails silently"
+  ],
+  "code_facts": {
+    "welcome_apply": "transport.rs:571 applies welcome.last_clip unconditionally; hub.rs:742 replays ALL offers incl. own device",
+    "arm": "mod.rs:1545 source.arm() -> OleSetClipboard replaces clipboard ~400ms after any inbound FileOffer",
+    "batch_apply": "mod.rs:1633 applies received files to local clipboard ~500ms after a pull completes",
+    "dedup": "clipboard.rs decide(): identical re-copy suppressed (Same{stale:false} / seen.image/text equal)"
+  },
+  "pending_session": null,
+  "confirmed_root_cause": "restart/reconnect causes two stomps: (1) welcome.last_clip applied unconditionally; (2) fresh clipboard thread first-poll republishes current clipboard to all peers"
+}

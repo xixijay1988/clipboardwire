@@ -99,6 +99,16 @@ const MAX_FILES_READ_ERRORS: u32 = 3;
 /// Same ~1 s budget as the error streak.
 const MAX_FILES_ABSENT_TICKS: u32 = 3;
 
+/// How long a fresh local copy keeps the clipboard against inbound
+/// writes. A remote clip, a `welcome.last_clip` replay, or a received-
+/// files batch arriving inside this window would overwrite the copy
+/// before the user has had a chance to paste it — the "copy, paste,
+/// nothing" failure mode. After the window the remote value wins
+/// again: last-writer-wins is the point of syncing clipboards. The
+/// supervisor applies the same window to writes that bypass this
+/// thread (the Windows OLE promise arm).
+pub(crate) const LOCAL_COPY_GRACE: Duration = Duration::from_secs(5);
+
 impl Seen {
     /// Record a locally-applied remote clip. Writing any representation
     /// replaces the *whole* OS clipboard, so the other trackers are
@@ -437,6 +447,27 @@ fn run_arboard_loop(
     // cache, so each medium needs its own slot.
     let mut seen = Seen::default();
 
+    // Seed every tracker from the clipboard's current state *without
+    // publishing it*. A fresh thread's first emission used to be
+    // whatever happened to be on the clipboard at startup — which meant
+    // every config reload / process start re-broadcast the local
+    // clipboard to every peer and overwrote *their* clipboards. Now the
+    // first emission must be a change made while the thread runs.
+    // `poll_clipboard` updates `seen` as a side effect, so discarding
+    // its result converges the trackers; bounded because each emission
+    // fills one tracker and there are only three kinds.
+    let mut seeded_any = false;
+    for _ in 0..8 {
+        if poll_clipboard(&mut cb, &mut seen).is_some() {
+            seeded_any = true;
+        } else {
+            break;
+        }
+    }
+    // A non-empty clipboard at startup counts as local content the user
+    // may still paste: give it the same grace a fresh copy would get.
+    let mut last_local_emit: Option<Instant> = seeded_any.then(Instant::now);
+
     let poll = Duration::from_millis(poll_ms);
     let mut next_poll = Instant::now() + poll;
 
@@ -446,8 +477,37 @@ fn run_arboard_loop(
 
         match apply_rx.recv_timeout(wait) {
             Ok(change) => {
-                apply_change(&mut cb, change, &mut seen);
-                continue;
+                // Publish a local change the user made since the last
+                // poll before judging this apply: an apply landing
+                // inside the sub-poll window would otherwise overwrite
+                // content the tracker has never seen — and it would be
+                // lost for good.
+                if let Some(pending) = poll_clipboard(&mut cb, &mut seen) {
+                    if !emit_change(&events_tx, &mut last_local_emit, pending) {
+                        return;
+                    }
+                }
+                match should_apply(&seen, last_local_emit, Instant::now(), &change) {
+                    ApplyVerdict::Apply => {
+                        apply_change(&mut cb, change, &mut seen);
+                        continue;
+                    }
+                    ApplyVerdict::SkipLocalFresh => {
+                        // The user's copy is younger than this inbound
+                        // write. Skipping drops the remote value on this
+                        // machine only — the hub still holds it in
+                        // `last_clip` / the offer registry.
+                        debug!("skipping inbound apply; local copy is still fresh");
+                        continue;
+                    }
+                    ApplyVerdict::SkipNoop => {
+                        // Already on the clipboard (e.g. `welcome.last_clip`
+                        // replaying our own clip back at us). Rewriting
+                        // would only strip formats the source put there.
+                        trace!("skipping no-op apply; content already on the clipboard");
+                        continue;
+                    }
+                }
             }
             Err(smpsc::RecvTimeoutError::Timeout) => {}
             Err(smpsc::RecvTimeoutError::Disconnected) => {
@@ -459,28 +519,106 @@ fn run_arboard_loop(
         next_poll = Instant::now() + poll;
 
         if let Some(change) = poll_clipboard(&mut cb, &mut seen) {
-            match events_tx.try_send(change) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("events channel full; dropping clipboard change");
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("events channel closed; clipboard thread exiting");
-                    return;
-                }
+            if !emit_change(&events_tx, &mut last_local_emit, change) {
+                return;
             }
         }
     }
+}
+
+/// Push a local change toward the supervisor and mark the clipboard as
+/// locally-owned. The timestamp is set before the send attempt — the
+/// user's copy exists either way, so an apply racing the emission
+/// loses either way. Returns `false` when the supervisor is gone.
+fn emit_change(
+    events_tx: &mpsc::Sender<ClipChange>,
+    last_local_emit: &mut Option<Instant>,
+    change: ClipChange,
+) -> bool {
+    *last_local_emit = Some(Instant::now());
+    match events_tx.try_send(change) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("events channel full; dropping clipboard change");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!("events channel closed; clipboard thread exiting");
+            false
+        }
+    }
+}
+
+/// Whether `change` already equals the tracked clipboard contents —
+/// writing it would be a no-op at best and a format-stripping rewrite
+/// at worst.
+fn seen_matches(seen: &Seen, change: &ClipChange) -> bool {
+    match change {
+        ClipChange::Text(t) => seen.text.as_deref() == Some(t.as_str()),
+        ClipChange::Image(i) => seen.image.as_ref() == Some(i),
+        ClipChange::Files(p) => seen.files.as_deref() == Some(p.as_slice()),
+    }
+}
+
+/// What the apply branch should do with an inbound write.
+///
+/// Pulled out of the loop as a pure function so the conflict rule —
+/// "a fresh local copy beats a remote clip, a replay, or a received
+/// batch" — is testable without an OS clipboard.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum ApplyVerdict {
+    /// Write it: no conflict with anything local.
+    Apply,
+    /// A local emit happened inside [`LOCAL_COPY_GRACE`]; the user's
+    /// copy is newer than this inbound write, so it keeps the
+    /// clipboard.
+    SkipLocalFresh,
+    /// The inbound content is already what the clipboard holds —
+    /// writing it would only strip formats.
+    SkipNoop,
+}
+
+fn should_apply(
+    seen: &Seen,
+    last_local_emit: Option<Instant>,
+    now: Instant,
+    change: &ClipChange,
+) -> ApplyVerdict {
+    if last_local_emit.is_some_and(|t| now.saturating_duration_since(t) < LOCAL_COPY_GRACE) {
+        return ApplyVerdict::SkipLocalFresh;
+    }
+    if seen_matches(seen, change) {
+        return ApplyVerdict::SkipNoop;
+    }
+    ApplyVerdict::Apply
+}
+
+/// `OpenClipboard` loses to another app holding the clipboard —
+/// Explorer mid-copy is the common case, so a failed set is usually a
+/// few-hundred-millisecond conflict rather than a hard error. A short
+/// retry beats dropping the inbound clip on the floor (or, worse,
+/// marking it applied when nothing was written).
+fn retry_apply<E: std::fmt::Display>(mut set: impl FnMut() -> Result<(), E>) -> Result<(), E> {
+    const ATTEMPTS: u32 = 4;
+    for attempt in 1..ATTEMPTS {
+        match set() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                trace!(attempt, error = %e, "clipboard write failed; retrying");
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+    set()
 }
 
 fn apply_change(cb: &mut arboard::Clipboard, change: ClipChange, seen: &mut Seen) {
     match change {
         ClipChange::Text(text) => {
             trace!(kind = "text", len = text.len(), "applying clip");
-            if let Err(e) = cb.set_text(text.clone()) {
-                warn!(error = %e, "clipboard set_text failed");
-            } else {
-                seen.mark_applied(&ClipChange::Text(text));
+            match retry_apply(|| cb.set_text(text.clone())) {
+                Ok(()) => seen.mark_applied(&ClipChange::Text(text)),
+                Err(e) => warn!(error = %e, "clipboard set_text failed"),
             }
         }
         ClipChange::Image(img) => {
@@ -490,20 +628,21 @@ fn apply_change(cb: &mut arboard::Clipboard, change: ClipChange, seen: &mut Seen
                 height = img.height,
                 "applying clip"
             );
-            let arboard_image = arboard::ImageData {
-                width: img.width as usize,
-                height: img.height as usize,
-                bytes: std::borrow::Cow::Owned(img.rgba.clone()),
-            };
-            if let Err(e) = cb.set_image(arboard_image) {
-                warn!(error = %e, "clipboard set_image failed");
-            } else {
-                seen.mark_applied(&ClipChange::Image(img));
+            let result = retry_apply(|| {
+                cb.set_image(arboard::ImageData {
+                    width: img.width as usize,
+                    height: img.height as usize,
+                    bytes: std::borrow::Cow::Owned(img.rgba.clone()),
+                })
+            });
+            match result {
+                Ok(()) => seen.mark_applied(&ClipChange::Image(img)),
+                Err(e) => warn!(error = %e, "clipboard set_image failed"),
             }
         }
         ClipChange::Files(paths) => {
             trace!(kind = "files", count = paths.len(), "applying clip");
-            match files_clipboard::write_files(&paths) {
+            match retry_apply(|| files_clipboard::write_files(&paths)) {
                 Ok(()) => {
                     // Echo suppression: when our own poll next runs
                     // it'll find these exact paths and skip them.
@@ -1049,5 +1188,81 @@ mod tests {
         }
         let out = decide(&mut seen, FilesRead::NoFiles, Some(icon()), TextRead::Error);
         assert_eq!(out, Some(ClipChange::Image(icon())));
+    }
+
+    /// The reported failure: "copy a file, paste, nothing". A remote
+    /// write landing inside the grace window after a local emit would
+    /// erase the copy before it can be pasted — the guard makes the
+    /// local copy win.
+    #[test]
+    fn a_fresh_local_copy_survives_an_inbound_apply() {
+        let seen = Seen {
+            text: Some("mine".into()),
+            ..Seen::default()
+        };
+        let now = Instant::now();
+        assert_eq!(
+            should_apply(&seen, Some(now), now, &ClipChange::Text("theirs".into())),
+            ApplyVerdict::SkipLocalFresh
+        );
+        // And the same is true for an inbound image or file list.
+        assert_eq!(
+            should_apply(&seen, Some(now), now, &ClipChange::Files(docx_paths())),
+            ApplyVerdict::SkipLocalFresh
+        );
+    }
+
+    /// The window is bounded: once the user has had time to paste, a
+    /// remote clip wins again — otherwise sync would never deliver.
+    #[test]
+    fn inbound_apply_wins_once_the_grace_window_passes() {
+        let seen = Seen {
+            text: Some("mine".into()),
+            ..Seen::default()
+        };
+        let emitted = Instant::now() - (LOCAL_COPY_GRACE + Duration::from_secs(1));
+        let now = Instant::now();
+        assert_eq!(
+            should_apply(
+                &seen,
+                Some(emitted),
+                now,
+                &ClipChange::Text("theirs".into())
+            ),
+            ApplyVerdict::Apply
+        );
+    }
+
+    /// A replay of content already on the clipboard (`welcome.last_clip`
+    /// echoing our own publish, an echo of an apply) must not rewrite
+    /// the clipboard — rewriting strips formats the source put there.
+    #[test]
+    fn identical_inbound_content_is_never_rewritten() {
+        let mut seen = Seen {
+            text: Some("same".into()),
+            ..Seen::default()
+        };
+        let now = Instant::now();
+        assert_eq!(
+            should_apply(&seen, None, now, &ClipChange::Text("same".into())),
+            ApplyVerdict::SkipNoop
+        );
+        // Different content still applies.
+        assert_eq!(
+            should_apply(&seen, None, now, &ClipChange::Text("other".into())),
+            ApplyVerdict::Apply
+        );
+
+        seen.files = Some(docx_paths());
+        assert_eq!(
+            should_apply(&seen, None, now, &ClipChange::Files(docx_paths())),
+            ApplyVerdict::SkipNoop
+        );
+
+        seen.image = Some(icon());
+        assert_eq!(
+            should_apply(&seen, None, now, &ClipChange::Image(icon())),
+            ApplyVerdict::SkipNoop
+        );
     }
 }

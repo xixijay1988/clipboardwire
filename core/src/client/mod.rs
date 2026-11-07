@@ -265,6 +265,7 @@ pub async fn run_with_status(
         None,
         send_policy,
         receive_policy,
+        Some(device_id),
     )
     .await;
     Ok(())
@@ -785,6 +786,7 @@ pub async fn run_supervisor_with_options(
         save_dir,
         SendPolicy::default(),
         ReceivePolicy::default(),
+        None,
     )
     .await;
 }
@@ -794,6 +796,7 @@ pub async fn run_supervisor_with_options(
 /// Separate from `..._with_options` so the existing callers — the integration
 /// tests, which never publish files through the supervisor — do not have to
 /// name a policy they do not care about.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_supervisor_with_policy(
     mut clipboard: Clipboard,
     mut transport: Transport,
@@ -802,6 +805,7 @@ pub async fn run_supervisor_with_policy(
     save_dir: Option<std::path::PathBuf>,
     send_policy: SendPolicy,
     receive_policy: ReceivePolicy,
+    self_device: Option<Uuid>,
 ) {
     // **One** resolution of "where do received files go", shared by both receive
     // paths. `None` from the caller means "the platform default", not "nowhere":
@@ -874,6 +878,13 @@ pub async fn run_supervisor_with_policy(
     // unchanged path is the whole point of supersession, and that requires
     // remembering what was advertised last time.
     let mut offers = offer::OfferRegistry::default();
+
+    // When a *local* change was last emitted — i.e. the clipboard currently
+    // holds user-copied content. Inbound writes that bypass the clipboard
+    // thread's guard (the OLE promise arm, the received-files batch) check
+    // this before replacing the local clipboard: inside
+    // `clipboard::LOCAL_COPY_GRACE` the user's copy wins.
+    let mut last_local_emit: Option<tokio::time::Instant> = None;
 
     // Whether the "hub cannot do lazy, falling back to eager" warning has been
     // logged on the *current* connection. A user who copies ten files against a
@@ -963,6 +974,9 @@ pub async fn run_supervisor_with_policy(
                     debug!("clipboard events channel closed; supervisor exiting");
                     return;
                 };
+                // The clipboard thread guards applies too; this timestamp is
+                // for the writes it cannot see (promise arm, files batch).
+                last_local_emit = Some(tokio::time::Instant::now());
                 match change {
                     // Text + image: one frame on the wire each.
                     ClipChange::Text(_) | ClipChange::Image(_) => {
@@ -1323,6 +1337,19 @@ pub async fn run_supervisor_with_policy(
                     }
                     Frame::FileOffer(offer) => {
                         let name = crate::logging::redact_file_name(&offer.name, log_file_names);
+                        // `welcome.offers` replays every live offer — the hub
+                        // does not exclude the registering device, so our own
+                        // advertisements come back at us on every reconnect.
+                        // Acting on one (arming a promise, pulling it) would
+                        // replace the local clipboard with a self-reference.
+                        if offer.from_device.is_some() && offer.from_device == self_device {
+                            debug!(
+                                file_id = %offer.file_id,
+                                file = %name,
+                                "ignoring replay of our own offer"
+                            );
+                            continue;
+                        }
                         // An offer from a hub is only actionable if this build
                         // can pull at all; `client_caps` decides that, and the
                         // hub should never send one otherwise.
@@ -1539,13 +1566,30 @@ pub async fn run_supervisor_with_policy(
                 }
             }
             _ = &mut promise_fut, if promise_deadline.is_some() => {
-                promise_deadline = None;
-                let files = std::mem::take(&mut promise_files);
-                if let Some(source) = paste_source.as_ref() {
-                    source.arm(files);
+                if last_local_emit.is_some_and(|t| t.elapsed() < clipboard::LOCAL_COPY_GRACE) {
+                    // Arming replaces the whole clipboard; doing it inside
+                    // the grace window would trample a copy the user has
+                    // not pasted yet. Defer — the batch is kept and the
+                    // deadline refires after the window.
+                    promise_deadline =
+                        Some(tokio::time::Instant::now() + clipboard::LOCAL_COPY_GRACE);
+                } else {
+                    promise_deadline = None;
+                    let files = std::mem::take(&mut promise_files);
+                    if let Some(source) = paste_source.as_ref() {
+                        source.arm(files);
+                    }
                 }
             }
             _ = receive_tick.tick() => {
+                if !*transport.connected.borrow() {
+                    // No connection, so nothing can make progress this
+                    // tick. Letting the stale timers run anyway burns
+                    // the restart budget on an outage — every session
+                    // hits "too many restarts" during a flap storm —
+                    // instead of on a genuine stall.
+                    continue;
+                }
                 let now = now_millis();
                 // Aborted sessions restart here, one tick after the abort:
                 // far enough apart that a `busy` answer is not retried into
@@ -1623,18 +1667,27 @@ pub async fn run_supervisor_with_policy(
                 }
             }
             _ = &mut deadline_fut, if pending_deadline.is_some() => {
-                pending_deadline = None;
-                if !pending_files.is_empty() {
-                    let batch = std::mem::take(&mut pending_files);
-                    tracing::info!(
-                        count = batch.len(),
-                        "applying received-files batch to local clipboard"
-                    );
-                    if let Err(e) = clipboard.apply_tx.send(ClipChange::Files(batch)) {
-                        warn!(
-                            error = %e,
-                            "clipboard thread gone; can't expose received files in clipboard"
+                if last_local_emit.is_some_and(|t| t.elapsed() < clipboard::LOCAL_COPY_GRACE) {
+                    // Same guard as the promise arm: the batch would
+                    // overwrite a copy the user just made. The files are
+                    // saved on disk already, so deferring costs only a
+                    // late clipboard write.
+                    pending_deadline =
+                        Some(tokio::time::Instant::now() + clipboard::LOCAL_COPY_GRACE);
+                } else {
+                    pending_deadline = None;
+                    if !pending_files.is_empty() {
+                        let batch = std::mem::take(&mut pending_files);
+                        tracing::info!(
+                            count = batch.len(),
+                            "applying received-files batch to local clipboard"
                         );
+                        if let Err(e) = clipboard.apply_tx.send(ClipChange::Files(batch)) {
+                            warn!(
+                                error = %e,
+                                "clipboard thread gone; can't expose received files in clipboard"
+                            );
+                        }
                     }
                 }
             }
@@ -1984,6 +2037,7 @@ mod tests {
         // refuse to publish an offer this hub could not serve (see
         // `SendPolicy::may_publish_offers`).
         let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Some(Caps::LAZY_FILE));
+        let (_connected_tx, connected_rx) = tokio::sync::watch::channel(true);
         let transport = Transport {
             inbound_rx,
             inbound_files_rx: None,
@@ -1992,6 +2046,7 @@ mod tests {
             inbound_control_rx: None,
             outbound_control_tx,
             hub_caps,
+            connected: connected_rx.clone(),
         };
 
         let supervisor = tokio::spawn(run_supervisor_with_policy(
@@ -2006,6 +2061,7 @@ mod tests {
                 ..SendPolicy::default()
             },
             ReceivePolicy::default(),
+            None,
         ));
 
         events_tx
@@ -2062,6 +2118,7 @@ mod tests {
         let (outbound_control_tx, mut outbound_control_rx) = tokio::sync::mpsc::channel::<Frame>(8);
         let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<ClipFrame>(8);
         let (_hub_caps_tx, hub_caps) = tokio::sync::watch::channel(Some(Caps::LAZY_FILE));
+        let (_connected_tx, connected_rx) = tokio::sync::watch::channel(true);
 
         let (progress_tx, mut progress_rx) = tokio::sync::broadcast::channel::<TransferProgress>(8);
 
@@ -2078,6 +2135,7 @@ mod tests {
                 inbound_control_rx: None,
                 outbound_control_tx,
                 hub_caps,
+                connected: connected_rx.clone(),
             },
             Some(progress_tx),
             false,
@@ -2088,6 +2146,7 @@ mod tests {
                 ..SendPolicy::default()
             },
             ReceivePolicy::default(),
+            None,
         ));
 
         events_tx
@@ -2206,6 +2265,7 @@ mod tests {
         let (outbound_control_tx, outbound_control_rx) = mpsc::channel::<Frame>(8);
         let (inbound_tx, inbound_rx) = mpsc::channel::<ClipFrame>(8);
         let (hub_caps_tx, hub_caps_rx) = tokio::sync::watch::channel(Some(hub_caps));
+        let (_connected_tx, connected_rx) = tokio::sync::watch::channel(true);
         // Leak both ends of the clip path. A dropped outbound receiver makes
         // the supervisor's `try_send` fail; a dropped inbound *sender* closes
         // `inbound_rx`, which the supervisor reads as "transport gone" and
@@ -2221,6 +2281,7 @@ mod tests {
                 inbound_control_rx: None,
                 outbound_control_tx,
                 hub_caps: hub_caps_rx,
+                connected: connected_rx,
             },
             outbound_control_rx,
             outbound_files_rx,
@@ -2274,6 +2335,7 @@ mod tests {
                 ..SendPolicy::default()
             },
             ReceivePolicy::default(),
+            None,
         ));
 
         events_tx
@@ -2338,6 +2400,7 @@ mod tests {
                 ..SendPolicy::default()
             },
             ReceivePolicy::default(),
+            None,
         ));
 
         events_tx
@@ -2389,6 +2452,7 @@ mod tests {
                 ..SendPolicy::default()
             },
             ReceivePolicy::default(),
+            None,
         ));
 
         // First copy: the empty caps force eager.
