@@ -124,8 +124,9 @@ macOS receiver:
     file. A paste whose pull makes no progress for ~2 minutes — e.g.
     the hub dropped mid-paste, where no stall checks run — gives up and
     fails the same way; the pull may still complete into the spool
-    afterwards. (A pull that keeps making progress — a large file on a
-    slow link — never trips this: the deadline is idle, not total.)
+    afterwards. (The idle clock counts bytes arriving — including
+    re-downloaded bytes after a pull restart — so a healthy but slow
+    pull, however large, never trips it.)
 14. **Cancel from Preparing.** Cmd+V, then press the stop button in
     Finder's "preparing to copy" dialog → the copy aborts on the Finder
     side; the pull may complete into the spool harmlessly and a later

@@ -1,8 +1,8 @@
 {
-  "round": 3,
-  "total_rounds": 3,
-  "pending_operation": null,
+  "round": 4,
+  "total_rounds": 4,
+  "pending_operation": "cw-macos-paste-r4",
   "last_result": "openspec/changes/archive/2026-11-16-macos-paste-presenter/impl-report.md",
-  "next_action": "done",
-  "notes": "r3 committed 75579e8 and pushed. Coordinated-read smoke passed 2x: relinquish->pull->verified->fill->reacquirer, process alive after both reads -> forget removal confirmed safe on a real Foundation path."
+  "next_action": "verify-then-commit-push",
+  "notes": "r4 (user-approved new cycle): SpoolInner epoch counter bumped on every update() call; wait_idle_while resets deadline on epoch change so restart re-downloads (committed frozen) count as activity. Disconnected still trips idle; restart loops bounded by MAX_RESTARTS. After r4 lands: lead verifies gates, commits, pushes."
 }

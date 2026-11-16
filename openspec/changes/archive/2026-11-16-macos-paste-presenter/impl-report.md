@@ -217,3 +217,55 @@ $ cargo build -p clipboardwire-core --target aarch64-apple-darwin
 Both items are test-verified end-to-end through `render_placeholder`
 (the same code path the presenter callback runs); the only unverifiable
 piece remains the real-Finder surface itself.
+
+## Round 4 — restart re-download liveness (`core/src/client/paste.rs`)
+
+The r3 idle deadline watched `committed` grow — but `committed` is a
+`max()` over contiguous verified bytes, and a pull restarted from index
+0 re-downloads already-committed bytes without growing it. `update()`
+still fires per accepted chunk, so the waiter woke, saw no growth, and
+kept its deadline: a healthy re-download lasting >120 s would have
+failed the paste -43.
+
+- `SpoolInner` gains `activity: u64` — a monotonic counter bumped on
+  **every** `update()` call, inside the same lock, before the `max`.
+  `wait_idle_while` resets its deadline when `activity` changes.
+  Semantics are now "no accepted chunk for `idle`": a disconnected
+  transport calls `update` zero times → still trips; `Ignored` chunks
+  never reach `advance` → don't count; restart loops can't pin it
+  forever because `MAX_RESTARTS` ends them in `finish(Err)`.
+  `committed` is unchanged — it still means contiguous bytes for the
+  `Read` path.
+- `PASTE_RENDER_IDLE_TIMEOUT` comment rewritten to match: "no bytes
+  arriving", 120 s ≈ 8× `TAIL_STALL_TIMEOUT_MS`.
+- `wait_idle_while` doc rewritten: explains the activity epoch and why
+  re-downloads count.
+- New test: `render_placeholder_stays_alive_through_a_restart_redownload`
+  — `update(8192)` sets the high-water mark, then ~280 ms of
+  `update(1024)` re-download ticks under a 100 ms idle window, then
+  `finish(Ok)` → placeholder fills; `committed` never moved.
+  The silent-frontier timeout case stays covered by
+  `render_placeholder_gives_up_and_unlinks_on_timeout`.
+- `MANUAL_SMOKE.md` item 13: the idle-clock clause now notes that
+  re-downloaded bytes after a restart count as arriving.
+
+Round-4 gates (all run):
+
+```
+$ cargo fmt --check            → clean
+$ cargo clippy --all-targets -- -D warnings
+                               → Finished dev profile, 0 warnings
+$ cargo test                   → 387 passed; 0 failed (lib, +1 new)
+                               → all integration targets pass
+                               → paste::tests additionally run 3× clean
+$ cargo build -p clipboardwire-core --target aarch64-apple-darwin
+                               → Finished dev profile
+```
+
+Test-verified: the re-download liveness path, the idle timeout, and the
+deleted-placeholder fast-fail — all through `render_placeholder` on the
+same code path the presenter callback runs. Reasoning-only: that
+`PasteSink::advance` → `frontier.update` per accepted chunk is the real
+caller (verified by code read + reviewer's path check), and that
+`Ignored` outcomes skip it — both consistent with the counter
+semantics.

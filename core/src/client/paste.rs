@@ -68,6 +68,12 @@ pub struct SpoolFrontier {
 
 struct SpoolInner {
     committed: u64,
+    /// Monotonic activity counter, bumped on EVERY `update` call. An
+    /// idle-deadline waiter cannot use `committed` for this: it's a
+    /// `max()` over contiguous verified bytes, and a restarted pull
+    /// re-downloads already-committed bytes without growing it — the
+    /// bytes still count as "the link is alive".
+    activity: u64,
     outcome: Option<Result<(), String>>,
 }
 
@@ -76,6 +82,7 @@ impl SpoolFrontier {
         std::sync::Arc::new(Self {
             inner: std::sync::Mutex::new(SpoolInner {
                 committed: 0,
+                activity: 0,
                 outcome: None,
             }),
             cond: std::sync::Condvar::new(),
@@ -87,6 +94,7 @@ impl SpoolFrontier {
         std::sync::Arc::new(Self {
             inner: std::sync::Mutex::new(SpoolInner {
                 committed: u64::MAX,
+                activity: 0,
                 outcome: Some(Ok(())),
             }),
             cond: std::sync::Condvar::new(),
@@ -96,6 +104,7 @@ impl SpoolFrontier {
     /// More verified-contiguous bytes are readable.
     pub fn update(&self, committed: u64) {
         let mut g = self.inner.lock().unwrap();
+        g.activity += 1;
         g.committed = g.committed.max(committed);
         drop(g);
         self.cond.notify_all();
@@ -126,18 +135,27 @@ impl SpoolFrontier {
     }
 
     /// Like [`Self::wait`], but gives up when the pull stops looking
-    /// alive: `Err` if `committed` doesn't grow for `idle`, or if
-    /// `still_valid` — polled on every wake and every `poll` slice —
-    /// goes false. Not a wall-clock deadline: [`Self::update`] bumps
-    /// `committed` and notifies on every chunk, so a healthy pull of
-    /// any size keeps resetting the idle clock, while a disconnected
-    /// transport makes zero progress and still trips it.
+    /// alive: `Err` if no `update` lands for `idle`, or if `still_valid`
+    /// — polled on every wake and every `poll` slice — goes false. Not
+    /// a wall-clock deadline: every accepted chunk calls
+    /// [`Self::update`], so a healthy pull of any size keeps resetting
+    /// the idle clock, while a disconnected transport calls `update`
+    /// zero times and still trips it.
+    ///
+    /// The liveness signal is `activity` (a monotonic counter bumped on
+    /// every `update`), NOT `committed`: `committed` is a `max()` over
+    /// contiguous verified bytes, and a pull restarted from index 0
+    /// re-downloads already-committed bytes — `update` still fires per
+    /// accepted chunk, `committed` doesn't move. Watching `committed`
+    /// would idle-fail a healthy re-download; watching `activity`
+    /// doesn't. Restart loops can't keep it alive forever either —
+    /// `MAX_RESTARTS` ends them in `finish(Err)`.
     ///
     /// Two hangs an unbounded wait can't see:
     ///
     /// - **Disconnected transport.** The supervisor skips stall/restart
     ///   checks while offline, so no verdict ever lands — an idle
-    ///   deadline still catches it because nothing commits.
+    ///   deadline still catches it because nothing arrives.
     /// - **Killed render.** A re-arm deletes the placeholder mid-wait;
     ///   `still_valid` surfaces that within `poll` rather than waiting
     ///   out the pull to fail on a copy into a deleted path.
@@ -150,7 +168,7 @@ impl SpoolFrontier {
         poll: std::time::Duration,
         still_valid: impl Fn() -> bool,
     ) -> Result<(), String> {
-        let mut last_committed = 0;
+        let mut last_activity = 0;
         let mut deadline = std::time::Instant::now() + idle;
         let mut g = self.inner.lock().unwrap();
         loop {
@@ -160,8 +178,8 @@ impl SpoolFrontier {
             if let Some(outcome) = g.outcome.clone() {
                 return outcome;
             }
-            if g.committed != last_committed {
-                last_committed = g.committed;
+            if g.activity != last_activity {
+                last_activity = g.activity;
                 deadline = std::time::Instant::now() + idle;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -295,20 +313,21 @@ fn placeholder_path(file_id: uuid::Uuid, name: &str) -> PathBuf {
         .join(crate::client::file::sanitize_filename(name))
 }
 
-/// Longest a pull may go *without progress* before a paste render gives
-/// up and unlinks the placeholder (Finder surfaces -43). Idle, not
-/// total: every committed chunk resets it, so an arbitrarily large file
-/// on a slow-but-alive link still renders.
+/// Longest a pull may go *with no bytes arriving* before a paste render
+/// gives up and unlinks the placeholder (Finder surfaces -43). Idle,
+/// not total: every accepted chunk resets it — including re-downloaded
+/// bytes after a restart — so an arbitrarily large file on a
+/// slow-but-alive link still renders.
 ///
 /// Must be bounded because while the transport is disconnected the
 /// supervisor skips its stall/restart checks — a pull can sit
 /// un-unfinished forever, leaving Finder in "Preparing to copy"
 /// permanently and leaking the presenter-queue thread on cancel.
 /// 120 s is ~8× the per-attempt stall budget (`TAIL_STALL_TIMEOUT_MS`
-/// = 15 s): a link that commits nothing for two minutes is functionally
-/// dead — the restart machinery would have exhausted itself anyway —
-/// while a healthy pull rarely goes even one `TAIL_STALL` without a
-/// commit.
+/// = 15 s): a link that delivers nothing for two minutes is
+/// functionally dead — the restart machinery would have exhausted
+/// itself anyway — while a healthy pull rarely goes even one
+/// `TAIL_STALL` without an accepted chunk.
 #[cfg(any(target_os = "macos", test))]
 const PASTE_RENDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -1515,6 +1534,46 @@ mod tests {
         );
 
         assert_eq!(std::fs::read(&placeholder).unwrap(), b"slow but alive");
+        t.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_stays_alive_through_a_restart_redownload() {
+        // A restart re-pulls from index 0: `update()` keeps firing but
+        // with values at-or-below the old frontier, so `committed`
+        // never grows. Only the activity counter proves bytes are
+        // still arriving — the wait must not idle out.
+        let dir = scratch("redownload");
+        let partial = dir.join("partial");
+        std::fs::write(&partial, b"second time lucky").unwrap();
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let frontier = SpoolFrontier::new();
+        let writer = frontier.clone();
+        let t = std::thread::spawn(move || {
+            writer.update(8192); // pre-restart high-water mark
+            for _ in 0..7 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                // Re-downloaded prefix: `committed` stays at 8192.
+                writer.update(1024);
+            }
+            writer.finish(Ok(()));
+        });
+
+        render_placeholder_within(
+            Ok(SpoolStream {
+                path: partial,
+                len: 17,
+                frontier,
+            }),
+            &placeholder,
+            std::time::Duration::from_millis(100), // ~280 ms of updates
+            std::time::Duration::from_millis(20),
+        );
+
+        assert_eq!(std::fs::read(&placeholder).unwrap(), b"second time lucky");
         t.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
