@@ -407,9 +407,8 @@ impl ReceivePolicy {
     ///
     /// - `pickup` pulls immediately; `pickup_auto` only matters for a headless
     ///   build, which is expressed by the caller passing `None` for the tray.
-    /// - `paste` is Phase 6/7 and deliberately not implemented: it needs a
-    ///   platform clipboard hook, and half-implementing it here would look like
-    ///   it worked on the platforms that do not have one.
+    /// - `paste` does not pull on arrival: the pull starts when the
+    ///   platform's paste target asks for the bytes (`PasteEvent::Pull`).
     /// - `eager` and `auto`-resolving-to-`eager` do not pull.
     pub fn pulls_offers_automatically(&self) -> bool {
         matches!(self.resolved_mode(), ReceiveMode::Pickup)
@@ -417,14 +416,13 @@ impl ReceivePolicy {
 
     /// `receive_mode` after `auto` has been resolved for this platform.
     ///
-    /// `paste` only resolves on Windows, the one platform with a clipboard
-    /// that can render a file on demand (OLE delayed rendering). Everywhere
-    /// else it degrades to `pickup`: Linux rejects the config up front and on
-    /// macOS Finder cannot invoke a file-promise provider on Cmd+V — there is
-    /// no paste-time hook to hang a pull on.
+    /// `paste` resolves where the platform clipboard can render a file on
+    /// demand: Windows (OLE delayed rendering) and macOS (`NSFilePresenter`
+    /// placeholders — see `paste.rs`). Everywhere else it degrades to
+    /// `pickup`; Linux also rejects the config up front in `validate_modes`.
     pub fn resolved_mode(&self) -> ReceiveMode {
         match self.mode.resolved() {
-            ReceiveMode::Paste if !cfg!(windows) => ReceiveMode::Pickup,
+            ReceiveMode::Paste if !cfg!(any(windows, target_os = "macos")) => ReceiveMode::Pickup,
             m => m,
         }
     }
@@ -921,10 +919,11 @@ pub async fn run_supervisor_with_policy(
         resolved_save_dir.clone().map(receive::LazyAssembler::new)
     };
 
-    // `paste` mode (Windows): offers arm an OLE delayed-render promise; the
-    // pull only runs when a paste target asks for FileContents. `resolved_mode`
-    // already maps `paste` to `pickup` on non-Windows builds, so the channel
-    // here is only ever Some on Windows.
+    // `paste` mode: offers arm a clipboard promise — OLE delayed-render on
+    // Windows, `NSFilePresenter` placeholders on macOS. The pull only runs
+    // when a paste target asks for the bytes. `resolved_mode` already maps
+    // `paste` to `pickup` on platforms without a promise hook, so the
+    // channel here is only ever Some where one exists.
     let (paste_source, mut paste_events) =
         if matches!(receive_policy.resolved_mode(), ReceiveMode::Paste) {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2622,6 +2621,23 @@ mod tests {
             "an eager build has no engine behind the socket to answer an offer"
         );
         assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn paste_resolves_where_a_paste_hook_exists() {
+        // Windows (OLE delayed render) and macOS (NSFilePresenter
+        // placeholders) keep `paste`; every other platform degrades to
+        // `pickup` — defensive on Linux, which already refuses the config.
+        let policy = ReceivePolicy {
+            mode: ReceiveMode::Paste,
+            ..ReceivePolicy::default()
+        };
+        let expected = if cfg!(any(windows, target_os = "macos")) {
+            ReceiveMode::Paste
+        } else {
+            ReceiveMode::Pickup
+        };
+        assert_eq!(policy.resolved_mode(), expected);
     }
 
     #[test]

@@ -475,11 +475,25 @@ The object also implements `IDataObjectAsyncCapability`, which is what makes
 Explorer wrap the paste in its own async progress UI rather than freezing on
 the synchronous `GetData`.
 
-macOS deliberately has no equivalent: Finder does not invoke a file-promise
-provider on Cmd+V, so `receive_mode = "paste"` resolves to `pickup` there.
+macOS has no pasteboard-level callback Finder honours, so it uses the
+filesystem-level one instead (`NSFileCoordinator`). An arriving offer
+creates a 0-byte placeholder per file at
+`$TMPDIR/clipboardwire-paste/armed/<file_id>/<name>`, registers an
+`NSFilePresenter` for it, and puts the placeholder `file://` URLs on the
+general pasteboard. A Cmd+V in Finder coordinates a *read* of the
+placeholder, which fires `relinquishPresentedItemToReader:` on the
+presenter's own `NSOperationQueue` — no STA thread, no runloop. That
+callback runs the same lazy pull, blocks until the SHA-256 verdict, then
+copies the verified bytes into the placeholder and replies
+(`reader(reacquirer)` — the nested-block signature is what makes an
+asynchronous reply legal). A failed pull unlinks the placeholder before
+replying, so Finder reports error -43 rather than copying an empty file —
+the analogue of Windows' `E_ABORT`. There is no byte progress: Finder
+shows indeterminate "Preparing to copy" for the whole pull, then a normal
+copy. `auto` still resolves to `pickup`; `paste` on macOS is opt-in.
 
 The spool is invisible cache — pulled once, served to every later paste of
-the same `file_id` without pulling again; `%TEMP%` reclaims it.
+the same `file_id` without pulling again; the OS temp dir reclaims it.
 
 ## 4. The `clipboardwire` binary (`cli/`)
 

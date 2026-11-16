@@ -1,24 +1,34 @@
-//! Delayed-render clipboard promise behind `receive_mode = "paste"` (Windows).
+//! Delayed-render clipboard promise behind `receive_mode = "paste"`.
 //!
 //! Instead of pulling an offer the moment it arrives and dropping the file in
-//! the user's Downloads, this module owns the OLE clipboard with an
-//! `IDataObject` that advertises `FileGroupDescriptorW` + `FileContents`. The
-//! transfer only starts when a paste target (Explorer, an Office app, a file
-//! dialog) asks for `FileContents` — at that point [`PasteEvent::Pull`] goes
-//! back to the supervisor, which runs the normal lazy pull into a temp spool,
-//! verifies the digest, and hands the finished path back. Only then does an
-//! `IStream` over the verified file get returned, so a corrupt pull can never
-//! reach the paste destination.
+//! the user's Downloads, the offer arms the clipboard with a stand-in for the
+//! file. The transfer only starts when a paste target asks for the bytes — at
+//! that point [`PasteEvent::Pull`] goes back to the supervisor, which runs the
+//! normal lazy pull into a temp spool, verifies the digest, and hands the
+//! finished path back. A corrupt pull can never reach the paste destination.
 //!
-//! Threading: `OleSetClipboard` callbacks are marshalled onto the thread that
-//! owns the object, so a dedicated STA thread with a message pump hosts the
-//! promise. `GetData` may block for the duration of a whole pull — keeping it
-//! off the tao tray loop is the point of this thread. Commands arrive on a
-//! channel; the pump polls it between messages.
+//! Two backends implement the same observable contract:
 //!
-//! The non-Windows build keeps the same API as a no-op so the supervisor stays
-//! platform-free: `Paste` never resolves there (`receive_mode="paste"` falls
-//! back to `pickup` on macOS and is rejected on Linux).
+//! - **Windows** owns the OLE clipboard with an `IDataObject` advertising
+//!   `FileGroupDescriptorW` + `FileContents`; a paste target asking for
+//!   `FileContents` is what starts the pull. `GetData` returns an `IStream`
+//!   over the spool immediately, so the copy's progress tracks the network.
+//!   `OleSetClipboard` callbacks are marshalled onto the owning thread, so a
+//!   dedicated STA thread with a message pump hosts the promise — `GetData`
+//!   may block for the duration of a whole pull, and keeping it off the tao
+//!   tray loop is the point of that thread.
+//! - **macOS** creates an empty placeholder per file under
+//!   `<spool>/armed/<file_id>/<name>`, registers an `NSFilePresenter` for it,
+//!   and puts the placeholder `file://` URLs on the general pasteboard. A
+//!   Cmd+V in Finder coordinates a read of the placeholder, which fires
+//!   `relinquishPresentedItemToReader:` on the presenter's own
+//!   `NSOperationQueue`; the callback runs the pull, copies the verified
+//!   bytes into the placeholder (or unlinks it, surfacing error -43), and
+//!   only then replies. No byte progress is possible — Finder shows
+//!   indeterminate "Preparing to copy" for the whole pull.
+//!
+//! Other platforms keep the same API as a no-op so the supervisor stays
+//! platform-free: `receive_mode="paste"` is rejected on Linux at config load.
 
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
@@ -100,6 +110,20 @@ impl SpoolFrontier {
         drop(g);
         self.cond.notify_all();
     }
+
+    /// Block until the verdict is in: `Ok` once the whole file is spooled
+    /// and verified, `Err` with the failure reason.
+    ///
+    /// The macOS presenter waits on this rather than reading through the
+    /// frontier — its reader cannot see the placeholder until the reply,
+    /// so there is nothing to stream: only the final verdict matters.
+    pub fn wait(&self) -> Result<(), String> {
+        let mut g = self.inner.lock().unwrap();
+        while g.outcome.is_none() {
+            g = self.cond.wait(g).unwrap();
+        }
+        g.outcome.clone().unwrap()
+    }
 }
 
 /// A renderable file: the partial path plus the frontier that says how much
@@ -113,11 +137,20 @@ pub struct SpoolStream {
 
 /// Handle the supervisor uses to (re)arm the clipboard promise.
 pub struct PasteSource {
+    /// Windows and the no-op stub take commands on a channel — the STA
+    /// thread owns the promise object.
+    #[cfg(not(target_os = "macos"))]
     cmd: std::sync::mpsc::Sender<PasteCommand>,
+    /// macOS needs no command thread: presenter callbacks arrive on each
+    /// presenter's own `NSOperationQueue` (GCD-backed, headless-safe), so
+    /// `arm()` can update the registry and write the pasteboard inline.
+    #[cfg(target_os = "macos")]
+    imp: std::sync::Mutex<imp::MacPaste>,
 }
 
+#[cfg(not(target_os = "macos"))]
 enum PasteCommand {
-    // `Vec` is unused on non-Windows stubs; kept so `arm()` has one signature.
+    // `Vec` is unused on the no-promise stubs; kept so `arm()` has one signature.
     #[allow(dead_code)]
     Arm(Vec<PromiseFile>),
 }
@@ -125,19 +158,31 @@ enum PasteCommand {
 impl PasteSource {
     /// Replace the clipboard promise with one describing `files`. An empty
     /// vec just releases the clipboard.
+    #[cfg(not(target_os = "macos"))]
     pub fn arm(&self, files: Vec<PromiseFile>) {
         let _ = self.cmd.send(PasteCommand::Arm(files));
+    }
+
+    /// Replace the armed placeholders with ones describing `files`. An
+    /// empty vec disarms: presenters removed, `armed/` deleted.
+    #[cfg(target_os = "macos")]
+    pub fn arm(&self, files: Vec<PromiseFile>) {
+        match self.imp.lock() {
+            Ok(mut imp) => imp.arm(files),
+            Err(_) => tracing::warn!("paste presenter registry poisoned; skipping arm"),
+        }
     }
 }
 
 /// Spawn the promise host. `events` receives paste-time pull requests.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn spawn(events: UnboundedSender<PasteEvent>) -> PasteSource {
     imp::spawn(events)
 }
 
-/// Non-Windows stub: the promise can never fire, so the channel ends.
-#[cfg(not(windows))]
+/// Stub for platforms with no paste-time hook: the promise can never
+/// fire, so the channel ends.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn spawn(events: UnboundedSender<PasteEvent>) -> PasteSource {
     drop(events);
     let (cmd, _rx) = std::sync::mpsc::channel();
@@ -148,6 +193,71 @@ pub fn spawn(events: UnboundedSender<PasteEvent>) -> PasteSource {
 /// a cache the user never sees, cleaned by the OS like any temp file.
 pub fn spool_dir() -> PathBuf {
     std::env::temp_dir().join("clipboardwire-paste")
+}
+
+/// `<spool>/armed` — the root the macOS backend fills with one
+/// `<file_id>/<name>` placeholder per armed offer.
+///
+/// Platform-neutral even though only macOS creates it: the clipboard
+/// poller consults it on every OS, and "paths under our own armed dir are
+/// never publishable as offers" should have exactly one home.
+pub fn armed_dir() -> PathBuf {
+    spool_dir().join("armed")
+}
+
+/// Whether `path` is one of our own armed placeholders. Such a path on
+/// the clipboard is the residue of an arm, not a user copy — publishing
+/// it as an offer would echo our own spool back to the hub (and after a
+/// paste fills the placeholder, would re-echo on every identity change).
+pub fn is_armed_placeholder(path: &std::path::Path) -> bool {
+    path.starts_with(armed_dir())
+}
+
+/// Where one armed offer's placeholder lives:
+/// `armed/<file_id>/<sanitized-name>`.
+///
+/// The per-offer directory does two jobs at once: same-named offers can
+/// never collide with each other, and a placeholder can never coincide
+/// with the `<file_id>.partial` the pull writes at the spool root. The
+/// name is sanitized with the same rule the landing path uses.
+#[cfg(any(target_os = "macos", test))]
+fn placeholder_path(file_id: uuid::Uuid, name: &str) -> PathBuf {
+    armed_dir()
+        .join(file_id.to_string())
+        .join(crate::client::file::sanitize_filename(name))
+}
+
+/// Fill `placeholder` from a paste pull's outcome, or delete it so the
+/// waiting reader surfaces a copy error instead of an empty file.
+///
+/// `spool` is the supervisor's reply to [`PasteEvent::Pull`]: `Ok`
+/// carries the partial path + frontier, `Err` means the offer is gone.
+/// Waits on the frontier for the digest verdict, then copies the verified
+/// bytes into the placeholder — copy, not rename, because the verified
+/// partial stays in the spool for repeat pastes (`paste_sink.ready`) and
+/// `std::fs::copy` on APFS is a clone. A failed pull *or* a failed copy
+/// ends with the placeholder unlinked — Finder then reports error -43,
+/// the analogue of Windows' `E_ABORT`.
+///
+/// Platform-neutral so the fill-or-unlink decision is testable without
+/// AppKit; the macOS presenter is the only caller.
+#[cfg(any(target_os = "macos", test))]
+fn render_placeholder(spool: Result<SpoolStream, String>, placeholder: &std::path::Path) {
+    let filled = spool
+        .and_then(|s| s.frontier.wait().map(|()| s))
+        .and_then(|s| {
+            std::fs::copy(&s.path, placeholder)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+    if let Err(reason) = filled {
+        tracing::debug!(
+            path = %placeholder.display(),
+            error = %reason,
+            "paste render failed; removing the placeholder"
+        );
+        let _ = std::fs::remove_file(placeholder);
+    }
 }
 
 #[cfg(windows)]
@@ -715,5 +825,473 @@ mod imp {
                 }
             }
         }
+    }
+}
+
+/// macOS backend: armed offers become 0-byte placeholders under
+/// `<spool>/armed/<file_id>/<name>`, each presented to the file-
+/// coordination daemon. A Cmd+V in Finder coordinates a read of the
+/// placeholder, which fires `relinquishPresentedItemToReader:` on the
+/// presenter's own `NSOperationQueue`; that callback runs the normal lazy
+/// pull, copies the verified bytes into the placeholder (or unlinks it,
+/// surfacing a -43 copy error), and only then answers the relinquish.
+///
+/// No dedicated thread exists here: the presenter queues are the
+/// callbacks' threads, and `arm` mutates the registry inline from the
+/// supervisor. Blocking a presenter queue for the whole pull is the
+/// relinquish contract — the reader waits for our reply either way.
+/// Shape and the nested `reader(reacquirer)` reply proven by
+/// `tools/spike-macos-paste` (see `openspec/changes/macos-paste-presenter/`).
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{PasteEvent, PromiseFile};
+    use crate::client::files_clipboard;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tracing::{debug, info, warn};
+    use uuid::Uuid;
+
+    use block2::RcBlock;
+    use objc2::rc::{Allocated, Retained};
+    use objc2::{class, define_class, msg_send, ClassType, DefinedClass};
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::{NSError, NSObject, NSOperationQueue, NSString, NSURL};
+
+    /// The nested reply signature `relinquish…To(Reader|Writer):` takes:
+    /// a block we must call *with a reacquirer block of our own*. Calling
+    /// it argument-less corrupts Foundation's bookkeeping — the spike hit
+    /// `didRelinquish called, but there are no replies` after a copy that
+    /// had already succeeded.
+    type ReplyBlock = block2::DynBlock<dyn Fn(*mut block2::DynBlock<dyn Fn()>)>;
+
+    struct Ivars {
+        url: Retained<NSURL>,
+        queue: Retained<NSOperationQueue>,
+        /// The placeholder on disk — what `reader` must fill (or unlink).
+        path: PathBuf,
+        file_id: Uuid,
+        events: UnboundedSender<PasteEvent>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[name = "CWPastePresenter"]
+        #[ivars = Ivars]
+        struct Presenter;
+
+        impl Presenter {
+            #[unsafe(method(presentedItemURL))]
+            fn presented_item_url(&self) -> *mut NSURL {
+                Retained::autorelease_return(self.ivars().url.clone())
+            }
+
+            #[unsafe(method(presentedItemOperationQueue))]
+            fn presented_item_operation_queue(&self) -> *mut NSOperationQueue {
+                Retained::autorelease_return(self.ivars().queue.clone())
+            }
+
+            /// A coordinated reader (Finder's Cmd+V copy) wants the
+            /// placeholder's bytes. This callback IS the relinquish: it
+            /// stays on the presenter queue for the whole pull and replies
+            /// only once the placeholder holds verified bytes — or is
+            /// gone, which is how a failed pull becomes error -43.
+            #[unsafe(method(relinquishPresentedItemToReader:))]
+            unsafe fn relinquish_to_reader(&self, reader: &ReplyBlock) {
+                let file_id = self.ivars().file_id;
+                info!(file_id = %file_id, "paste requested; starting pull");
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                let result = match self
+                    .ivars()
+                    .events
+                    .send(PasteEvent::Pull {
+                        file_id,
+                        reply: reply_tx,
+                    }) {
+                    Ok(()) => match reply_rx.recv() {
+                        Ok(r) => r,
+                        Err(_) => Err("supervisor dropped the pull reply".to_string()),
+                    },
+                    Err(_) => Err("paste event channel closed".to_string()),
+                };
+                super::render_placeholder(result, &self.ivars().path);
+                // The reply takes OUR reacquirer block; Foundation invokes
+                // it when the read completes. Copying the incoming block to
+                // the heap keeps the spike's proven shape even though we
+                // answer inside the callback.
+                let reader = reader.copy();
+                let reacquirer = RcBlock::new(|| {
+                    debug!("reacquired after read");
+                });
+                let reacquirer_ptr = &*reacquirer
+                    as *const block2::DynBlock<dyn Fn()>
+                    as *mut block2::DynBlock<dyn Fn()>;
+                reader.call((reacquirer_ptr,));
+                // Foundation retains the reacquirer until the read ends,
+                // but forget ours so it cannot dangle if nothing copies it.
+                std::mem::forget(reacquirer);
+            }
+
+            /// Nothing but us writes the placeholder — allow immediately.
+            #[unsafe(method(relinquishPresentedItemToWriter:))]
+            unsafe fn relinquish_to_writer(&self, writer: &ReplyBlock) {
+                debug!(path = %self.ivars().path.display(), "relinquish to writer");
+                let reacquirer = RcBlock::new(|| {
+                    debug!("reacquired after write");
+                });
+                let reacquirer_ptr = &*reacquirer
+                    as *const block2::DynBlock<dyn Fn()>
+                    as *mut block2::DynBlock<dyn Fn()>;
+                writer.call((reacquirer_ptr,));
+                std::mem::forget(reacquirer);
+            }
+
+            #[unsafe(method(accommodatePresentedItemDeletionWithCompletionHandler:))]
+            unsafe fn accommodate_deletion(
+                &self,
+                completion: &block2::DynBlock<dyn Fn(*mut NSError)>,
+            ) {
+                debug!(path = %self.ivars().path.display(), "presented item deletion");
+                let _ = std::fs::remove_file(&self.ivars().path);
+                completion.call((std::ptr::null_mut(),));
+            }
+
+            #[unsafe(method(presentedItemDidMoveToURL:))]
+            unsafe fn did_move(&self, new_url: &NSURL) {
+                debug!(
+                    path = %self.ivars().path.display(),
+                    ?new_url,
+                    "presented item moved"
+                );
+            }
+
+            #[unsafe(method(presentedItemDidChange))]
+            fn did_change(&self) {
+                // Fires after Finder's copy touches the file; not a signal
+                // to act on.
+                debug!(path = %self.ivars().path.display(), "presented item changed");
+            }
+        }
+    );
+
+    impl Presenter {
+        fn new(
+            path: PathBuf,
+            file_id: Uuid,
+            events: UnboundedSender<PasteEvent>,
+        ) -> Retained<Self> {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let queue = NSOperationQueue::new();
+            queue.setName(Some(&NSString::from_str("clipboardwire.paste.presenter")));
+            // One callback at a time per file: the relinquish blocks for
+            // the whole pull, and nothing else may interleave on it.
+            queue.setMaxConcurrentOperationCount(1);
+            let this: Allocated<Self> = unsafe { msg_send![Self::class(), alloc] };
+            let this = this.set_ivars(Ivars {
+                url,
+                queue,
+                path,
+                file_id,
+                events,
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    // Callbacks run on the presenter's own NSOperationQueue — GCD worker
+    // threads — and the `Retained<Presenter>` lives in the supervisor's
+    // `Mutex`, so the class must be Send+Sync. Sound because the ivars
+    // are written once at init and only ever read afterwards.
+    unsafe impl Send for Presenter {}
+    unsafe impl Sync for Presenter {}
+
+    /// The current arm: one registered presenter per armed file, replaced
+    /// wholesale on the next `arm` — a new arm means a new clipboard
+    /// anyway.
+    pub struct MacPaste {
+        events: UnboundedSender<PasteEvent>,
+        presenters: Vec<Retained<Presenter>>,
+        /// Placeholder paths of the current arm, kept so `disarm` can tell
+        /// whether the pasteboard still holds *our* URLs.
+        armed_paths: Vec<PathBuf>,
+    }
+
+    impl MacPaste {
+        /// Replace the armed set: drop the old presenters and stale
+        /// `armed/` tree, create one 0-byte placeholder per file, register
+        /// a presenter for each, and put their `file://` URLs on the
+        /// general pasteboard.
+        pub fn arm(&mut self, files: Vec<PromiseFile>) {
+            self.disarm();
+            let mut armed = Vec::with_capacity(files.len());
+            for f in &files {
+                let path = super::placeholder_path(f.file_id, &f.name);
+                let Some(dir) = path.parent() else {
+                    continue;
+                };
+                let made = std::fs::create_dir_all(dir)
+                    .and_then(|()| std::fs::File::create(&path).map(|_| ()));
+                if let Err(e) = made {
+                    warn!(
+                        file_id = %f.file_id,
+                        error = %e,
+                        "could not create a paste placeholder"
+                    );
+                    continue;
+                }
+                let presenter = Presenter::new(path.clone(), f.file_id, self.events.clone());
+                // msg_send! — avoids needing ProtocolObject conformance;
+                // file coordination only checks respondsToSelector:.
+                unsafe {
+                    let _: () = msg_send![class!(NSFileCoordinator), addFilePresenter: &*presenter];
+                }
+                self.presenters.push(presenter);
+                armed.push(path);
+            }
+            self.armed_paths = armed;
+            if self.armed_paths.is_empty() {
+                return;
+            }
+            // The same write the inbound-apply path performs
+            // (`files_clipboard::write_files` = clearContents +
+            // writeObjects of the file:// URLs). Our own poller never
+            // re-publishes these paths — `is_armed_placeholder` filters
+            // them out of every files read.
+            match files_clipboard::write_files(&self.armed_paths) {
+                Ok(()) => debug!(count = self.armed_paths.len(), "clipboard promise armed"),
+                Err(e) => warn!(
+                    error = %format!("{e:#}"),
+                    "could not put placeholder URLs on the pasteboard"
+                ),
+            }
+        }
+
+        /// Unregister every presenter and delete `armed/`. The pasteboard
+        /// is cleared only while it still holds exactly our armed URLs —
+        /// a user copy that landed after the arm keeps the clipboard.
+        fn disarm(&mut self) {
+            for presenter in self.presenters.drain(..) {
+                unsafe {
+                    let _: () =
+                        msg_send![class!(NSFileCoordinator), removeFilePresenter: &*presenter];
+                }
+            }
+            let root = super::armed_dir();
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    error = %e,
+                    dir = %root.display(),
+                    "could not remove the armed placeholder dir"
+                ),
+            }
+            let armed = std::mem::take(&mut self.armed_paths);
+            if armed.is_empty() {
+                return;
+            }
+            if let Ok(Some(current)) = files_clipboard::read_files() {
+                if current == armed {
+                    NSPasteboard::generalPasteboard().clearContents();
+                }
+            }
+        }
+    }
+
+    impl Drop for MacPaste {
+        fn drop(&mut self) {
+            self.disarm();
+        }
+    }
+
+    pub fn spawn(events: UnboundedSender<PasteEvent>) -> super::PasteSource {
+        super::PasteSource {
+            imp: std::sync::Mutex::new(MacPaste {
+                events,
+                presenters: Vec::new(),
+                armed_paths: Vec::new(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique scratch dir under the OS temp dir — the suite cannot use a
+    /// shared tempdir crate, so uniqueness is pid + counter.
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("cw-paste-test-{label}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn frontier_wait_returns_ok_for_a_completed_spool() {
+        assert_eq!(SpoolFrontier::completed().wait(), Ok(()));
+    }
+
+    #[test]
+    fn frontier_wait_blocks_until_the_verdict_lands() {
+        let frontier = SpoolFrontier::new();
+        let writer = frontier.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            writer.finish(Ok(()));
+        });
+        assert_eq!(frontier.wait(), Ok(()));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn frontier_wait_propagates_the_failure_reason() {
+        let frontier = SpoolFrontier::new();
+        frontier.finish(Err("offer was withdrawn".to_string()));
+        assert_eq!(frontier.wait(), Err("offer was withdrawn".to_string()));
+    }
+
+    #[test]
+    fn placeholder_path_lives_under_armed_and_sanitizes_the_name() {
+        let id = uuid::Uuid::new_v4();
+        let path = placeholder_path(id, "../evil name.txt");
+        assert!(is_armed_placeholder(&path));
+        assert_eq!(path.parent().unwrap(), armed_dir().join(id.to_string()));
+        // Same rule the landing path uses: separators and controls become
+        // underscores, never a traversal.
+        assert_eq!(path.file_name().unwrap(), ".._evil name.txt");
+    }
+
+    #[test]
+    fn same_named_offers_never_collide() {
+        let a = placeholder_path(uuid::Uuid::new_v4(), "report.pdf");
+        let b = placeholder_path(uuid::Uuid::new_v4(), "report.pdf");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_pull_partial_is_not_an_armed_placeholder() {
+        // `<file_id>.partial` sits at the spool root — outside `armed/` —
+        // so the echo filter must not swallow it either.
+        let partial = spool_dir().join(format!("{}.partial", uuid::Uuid::new_v4()));
+        assert!(!is_armed_placeholder(&partial));
+        assert!(is_armed_placeholder(&placeholder_path(
+            uuid::Uuid::new_v4(),
+            "x"
+        )));
+    }
+
+    #[test]
+    fn render_placeholder_copies_verified_bytes_in() {
+        let dir = scratch("fill");
+        let partial = dir.join("partial");
+        std::fs::write(&partial, b"verified bytes").unwrap();
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+
+        render_placeholder(
+            Ok(SpoolStream {
+                path: partial.clone(),
+                len: 14,
+                frontier: SpoolFrontier::completed(),
+            }),
+            &placeholder,
+        );
+
+        // Copy, not rename: the verified partial stays for repeat pastes.
+        assert_eq!(std::fs::read(&placeholder).unwrap(), b"verified bytes");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"verified bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_waits_for_the_frontier() {
+        let dir = scratch("wait");
+        let partial = dir.join("partial");
+        std::fs::write(&partial, b"late bytes").unwrap();
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let frontier = SpoolFrontier::new();
+        let writer = frontier.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            writer.finish(Ok(()));
+        });
+
+        render_placeholder(
+            Ok(SpoolStream {
+                path: partial,
+                len: 10,
+                frontier,
+            }),
+            &placeholder,
+        );
+
+        assert_eq!(std::fs::read(&placeholder).unwrap(), b"late bytes");
+        t.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_unlinks_when_the_pull_fails() {
+        let dir = scratch("fail");
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+
+        render_placeholder(Err("offer was withdrawn".to_string()), &placeholder);
+
+        // The reader's coordinated read now hits ENOENT — the -43 surface.
+        assert!(!placeholder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_unlinks_when_the_frontier_fails() {
+        let dir = scratch("frontierfail");
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let frontier = SpoolFrontier::new();
+        frontier.finish(Err("digest mismatch".to_string()));
+
+        render_placeholder(
+            Ok(SpoolStream {
+                path: dir.join("partial"),
+                len: 0,
+                frontier,
+            }),
+            &placeholder,
+        );
+
+        assert!(!placeholder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_unlinks_when_the_copy_fails() {
+        // A missing spool path must not leave a 0-byte placeholder for the
+        // reader to copy — unlink it so the paste reports an error.
+        let dir = scratch("copyfail");
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+
+        render_placeholder(
+            Ok(SpoolStream {
+                path: dir.join("does-not-exist"),
+                len: 5,
+                frontier: SpoolFrontier::completed(),
+            }),
+            &placeholder,
+        );
+
+        assert!(!placeholder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

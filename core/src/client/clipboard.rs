@@ -36,6 +36,7 @@ use tracing::{debug, error, trace, warn};
 
 use super::files_clipboard;
 use super::offer::PinnedIdentity;
+use super::paste;
 
 /// Default-buffer size for the outbound events channel.
 const EVENT_BUFFER: usize = 32;
@@ -264,6 +265,27 @@ fn decide(
 /// Pure. The identity comparison uses the snapshot in `Seen`, which the poll
 /// loop refreshes via [`record_files_identity`] — this function never stats.
 fn decide_files(seen: &mut Seen, files: FilesRead) -> FilesDecision {
+    // Our own armed placeholders (macOS `receive_mode = "paste"`) sit on
+    // the clipboard as file:// URLs. Windows' `OleSetClipboard` arm
+    // escapes this trap structurally — a promise object is not a readable
+    // file list — but the macOS arm *is* a readable list, so it needs an
+    // explicit filter. These are scratch files, not user content:
+    // reporting them would offer our spool back to the hub, first at arm
+    // time and again on every identity change as a paste fills them.
+    let files = match files {
+        FilesRead::Files(paths) => {
+            let paths: Vec<PathBuf> = paths
+                .into_iter()
+                .filter(|p| !paste::is_armed_placeholder(p))
+                .collect();
+            if paths.is_empty() {
+                FilesRead::NoFiles
+            } else {
+                FilesRead::Files(paths)
+            }
+        }
+        other => other,
+    };
     match files {
         FilesRead::Files(paths) => {
             seen.files_err_streak = 0;
@@ -1231,6 +1253,39 @@ mod tests {
             ),
             ApplyVerdict::Apply
         );
+    }
+
+    /// macOS `paste` mode arms the clipboard with `file://` URLs of our
+    /// own placeholders — readable as a file list, unlike Windows' promise
+    /// object. Reading them back as a copy would publish our spool to the
+    /// hub, at arm time and again every time a paste rewrites them.
+    #[test]
+    fn armed_placeholders_are_never_published() {
+        let mut seen = Seen::default();
+        let placeholder = paste::armed_dir().join("a-file-id").join("armed-offer.txt");
+
+        // Armed clipboard, many ticks — never an emission. While any file
+        // URLs occupy the clipboard `poll_clipboard` skips the image/text
+        // reads entirely (the early return), so `decide` sees exactly this
+        // input even mid-arm and after a paste fills the placeholder.
+        for _ in 0..5 {
+            let out = decide(
+                &mut seen,
+                FilesRead::Files(vec![placeholder.clone()]),
+                None,
+                TextRead::Error,
+            );
+            assert_eq!(out, None, "an armed placeholder must not publish");
+        }
+
+        // A real copy on top still emits — the filter only hides our dir.
+        let out = decide(
+            &mut seen,
+            FilesRead::Files(vec![placeholder.clone(), docx_paths()[0].clone()]),
+            None,
+            TextRead::Error,
+        );
+        assert_eq!(out, Some(ClipChange::Files(docx_paths())));
     }
 
     /// A replay of content already on the clipboard (`welcome.last_clip`

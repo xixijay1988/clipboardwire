@@ -4,6 +4,23 @@ All notable changes to clipboardwire are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Added — paste mode on macOS (`receive_mode = "paste"`)
+
+`paste` is now a real mode on macOS instead of silently degrading to
+`pickup`. Offers arrive as empty placeholders under
+`$TMPDIR/clipboardwire-paste/armed/<file_id>/`, each registered with
+`NSFileCoordinator`; the placeholder `file://` URLs go on the general
+pasteboard. A Cmd+V in Finder coordinates a read of the placeholder,
+which starts the pull — Finder shows "preparing to copy" (indeterminate,
+no byte progress) until the file is spooled and SHA-256-verified, then
+copies the verified bytes. A failed or expired pull deletes the
+placeholder before the read is released, so Finder reports a copy error
+(-43) instead of saving an empty file — matching Windows' abort
+semantics. `receive_mode = "auto"` still resolves to `pickup` on macOS;
+paste is opt-in this release.
+
 ## [0.5.6] — 2026-11-07
 
 ### Fixed — first copy after a reconnect no longer gets overwritten

@@ -102,6 +102,35 @@ Windows receiver:
 9. **Version stamp.** Right-click the tray icon → bottom item reads
    `clipboardwire vX.Y.Z-tag+g<sha>`; menu has no large empty gap.
 
+### File transfer — paste mode (macOS receiver, `receive_mode = "paste"`)
+
+With `send_mode = "lazy"` on the sender and `receive_mode = "paste"` on a
+macOS receiver:
+
+10. **Copy, then wait.** Copy a file on A. On the Mac *nothing lands in
+    `~/Downloads/clipboardwire`* and nothing is pulled — the clipboard
+    holds `file://` URLs of 0-byte placeholders under
+    `$TMPDIR/clipboardwire-paste/armed/<file_id>/` (visible in
+    `ls -la $TMPDIR/clipboardwire-paste/armed/`).
+11. **Paste.** In a Finder window, Cmd+V → Finder shows a "preparing to
+    copy" dialog (indeterminate — no byte progress) while the pull runs
+    (log: `paste requested; starting pull`), then the file lands in the
+    paste directory with correct bytes (compare SHA-256).
+12. **Re-paste.** Cmd+V again in a different folder — the file lands a
+    second time *without* pulling again (served from the verified spool).
+13. **Failed pull → -43.** Take the source offline (or let the offer
+    expire), then Cmd+V → Finder reports a copy error dialog
+    (`错误代码 -43` / "error code -43", item not found) — never an empty
+    file.
+14. **Cancel from Preparing.** Cmd+V, then press the stop button in
+    Finder's "preparing to copy" dialog → the copy aborts on the Finder
+    side; the pull may complete into the spool harmlessly and a later
+    Cmd+V serves it.
+15. **Echo check.** After step 10, watch the receiver's log: no
+    `file_offer` must be published for a path under
+    `clipboardwire-paste/armed/` (the armed clipboard must not echo our
+    own placeholders back as an offer).
+
 ### Pickup mode (macOS / Windows receiver, `receive_mode = "auto"`)
 
 10. **Copy → file appears.** Copy a file on A → after the transfer the

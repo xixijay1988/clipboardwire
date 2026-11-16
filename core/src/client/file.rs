@@ -611,7 +611,10 @@ pub fn default_save_dir() -> Result<PathBuf> {
 /// Strip path separators and dangerous characters. We don't try to be
 /// clever about Unicode normalisation — we just refuse anything that
 /// would let a malicious sender escape `save_dir`.
-fn sanitize_filename(name: &str) -> String {
+///
+/// `pub(crate)` because the macOS paste backend names placeholders with
+/// exactly this rule — armed and landed names must agree.
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let trimmed = name.trim();
     let sanitised: String = trimmed
         .chars()

@@ -1,0 +1,29 @@
+[package]
+name = "spike-macos-paste"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Spike: does Finder's Cmd+V trigger NSFilePresenter on a placeholder file?"
+
+# Standalone crate — intentionally NOT a workspace member.
+[workspace]
+
+[dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "NSArray",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSError",
+    "NSOperation",
+    "NSFileCoordinator",
+    "NSFilePresenter",
+] }
