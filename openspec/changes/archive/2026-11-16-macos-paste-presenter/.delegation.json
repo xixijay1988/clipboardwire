@@ -1,8 +1,8 @@
 {
   "round": 4,
   "total_rounds": 4,
-  "pending_operation": "cw-macos-paste-r4",
+  "pending_operation": null,
   "last_result": "openspec/changes/archive/2026-11-16-macos-paste-presenter/impl-report.md",
-  "next_action": "verify-then-commit-push",
-  "notes": "r4 (user-approved new cycle): SpoolInner epoch counter bumped on every update() call; wait_idle_while resets deadline on epoch change so restart re-downloads (committed frozen) count as activity. Disconnected still trips idle; restart loops bounded by MAX_RESTARTS. After r4 lands: lead verifies gates, commits, pushes."
+  "next_action": "done",
+  "notes": "r4 committed and pushed. Activity-epoch idle deadline verified: committed frozen during restart re-download no longer trips the timer. All review findings closed."
 }
