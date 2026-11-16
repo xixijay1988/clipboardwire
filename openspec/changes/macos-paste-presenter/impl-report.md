@@ -95,6 +95,73 @@ inputs — the filter itself was already correct.
   items 10–15.
 - Windows build — code untouched and still `#[cfg(windows)]`-gated; no
   Windows toolchain on this host.
-- A mid-pull disconnect that neither aborts nor finishes the frontier is
-  bounded by the existing TailStall/restart-budget machinery, same as
-  Windows' blocked `GetData`.
+- ~~A mid-pull disconnect that neither aborts nor finishes the frontier is
+  bounded by the existing TailStall/restart-budget machinery~~ — **wrong**:
+  the stall checks are skipped entirely while `connected` is false. The
+  review caught this; round 2 bounds the render explicitly.
+
+## Round 2 — review fixes (all in `core/src/client/paste.rs` + docs)
+
+1. **Unbounded frontier wait during disconnect → bounded.** Added
+   `SpoolFrontier::wait_timeout(d)` (same condvar, deadline loop) and
+   `PASTE_RENDER_TIMEOUT = 180 s` — sized above the machinery's own
+   connected failure bound (`TAIL_STALL_TIMEOUT_MS` 15 s ×
+   `MAX_RESTARTS+1` ≈ 1 min) with margin for a large healthy pull.
+   `render_placeholder` now delegates to `render_placeholder_within`
+   (deadline as a parameter, for tests). Timeout → unlink →
+   `reader(reacquirer)` → Finder -43, same surface as every other
+   failure. `wait()` is unchanged for its other callers.
+   New test: `render_placeholder_gives_up_and_unlinks_on_timeout`
+   (never-finishing frontier, 50 ms deadline → elapsed ≥ 50 ms,
+   placeholder gone).
+2. **`mem::forget(reacquirer)` removed** from both relinquish callbacks.
+   Verified by API contract (reasoning + docs, not instrumentation):
+   Foundation invokes the reacquirer *after* `reader.call` returns —
+   after the coordinated read finishes — so it must hold its own
+   reference; the documented ObjC usage passes a *stack-block literal*
+   (`reader(^{ … })`), which could not survive the callback unless the
+   system copied it. Dropping our `RcBlock` on return is therefore safe
+   and reclaims the per-paste leak. Comments updated on both callbacks.
+3. **Re-arm killing an in-flight paste is now logged.** `Ivars` gains a
+   shared `Arc<AtomicBool> pending`; the reader callback sets it for the
+   render's duration, `Presenter::new` hands a copy back, `MacPaste`
+   keeps them parallel to `presenters`, and `disarm` `warn!`s
+   (`count = N, "re-arm killed an in-flight paste render"`) before
+   unregistering. Behaviour unchanged — the kill is correct (the new
+   copy replaces the clipboard) — it just leaves a trace now.
+4. **`is_armed_placeholder` compares both TMPDIR spellings.** The
+   pasteboard can hand back `/private/var/folders/...` while
+   `temp_dir()` reports `/var/folders/...` (verified on this host:
+   `TMPDIR=/var/folders/…/T`, `realpath=/private/var/folders/…/T`).
+   New `canonical_armed_dir()` canonicalizes `temp_dir` — which always
+   exists, so it can't fail the way canonicalizing a dead placeholder
+   could — cached in a `OnceLock`. The check is
+   `starts_with(armed_dir()) || starts_with(canonical_armed_dir())`.
+   New test: `placeholder_filter_recognizes_the_canonical_tmp_spelling`
+   (on this Mac the `/private` spelling fails the raw check and matches
+   only via the canonical root; on Linux it reduces to the raw check).
+5. **Non-coordinating readers documented.** `MANUAL_SMOKE.md` macOS
+   section notes `cp`/Mail/Slack-attachment readers copy the 0-byte
+   placeholder verbatim (silent, no pull, no error) — Finder Cmd+V is
+   the supported surface, an empty copy elsewhere is the known boundary.
+   `ARCHITECTURE.md` states the same in the presenter paragraph, and now
+   also records the bounded render.
+
+Round-2 gates (all run):
+
+```
+$ cargo fmt --check            → clean
+$ cargo clippy --all-targets -- -D warnings
+                               → Finished dev profile, 0 warnings
+$ cargo test                   → 384 passed; 0 failed (lib, +2 new)
+                               → all integration targets pass
+$ cargo build -p clipboardwire-core --target aarch64-apple-darwin
+                               → Finished dev profile
+```
+
+Verified vs reasoning-only: items 1, 3, 4 are test-verified (timeout
+unlink, canonical-spelling filter) or compile/logic-inspected (pending
+flag → warn). Item 2 is reasoning + Apple API-contract verification —
+the reacquirer MUST be retained by the system to fire after the read,
+and the documented call shape proves it copies — but it has no unit
+test; the real-Finder smoke run exercises it. Item 5 is docs.

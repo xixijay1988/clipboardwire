@@ -124,6 +124,30 @@ impl SpoolFrontier {
         }
         g.outcome.clone().unwrap()
     }
+
+    /// Like [`Self::wait`], but gives up after `timeout` with an `Err`
+    /// describing the deadline rather than a pull failure.
+    ///
+    /// The macOS render uses this because a pull can stall indefinitely:
+    /// while the transport is disconnected the supervisor skips its
+    /// stall/restart checks entirely, so no verdict ever lands — and an
+    /// unbounded wait would leave the reader (and the presenter-queue
+    /// thread that owns it) parked on the condvar forever.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some(outcome) = g.outcome.clone() {
+                return outcome;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("pull verdict did not arrive within {timeout:?}"));
+            }
+            let (guard, _) = self.cond.wait_timeout(g, remaining).unwrap();
+            g = guard;
+        }
+    }
 }
 
 /// A renderable file: the partial path plus the frontier that says how much
@@ -209,8 +233,28 @@ pub fn armed_dir() -> PathBuf {
 /// the clipboard is the residue of an arm, not a user copy — publishing
 /// it as an offer would echo our own spool back to the hub (and after a
 /// paste fills the placeholder, would re-echo on every identity change).
+///
+/// Compared under both spellings of the spool root: TMPDIR on macOS is
+/// `/var/folders/...`, which the pasteboard can hand back as
+/// `/private/var/folders/...`. `temp_dir` itself always exists, so
+/// canonicalizing it works even when `armed/` or the placeholder is
+/// already gone (canonicalizing the placeholder could fail on a dead
+/// path and leak it through the filter).
 pub fn is_armed_placeholder(path: &std::path::Path) -> bool {
-    path.starts_with(armed_dir())
+    path.starts_with(armed_dir()) || path.starts_with(canonical_armed_dir())
+}
+
+/// The armed root under the canonical spelling of TMPDIR — the form a
+/// reader may report. Cached: TMPDIR is fixed for the process, and the
+/// clipboard poller consults this on every files read.
+fn canonical_armed_dir() -> &'static std::path::Path {
+    static CANON: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CANON.get_or_init(|| {
+        std::env::temp_dir()
+            .canonicalize()
+            .map(|t| t.join("clipboardwire-paste").join("armed"))
+            .unwrap_or_else(|_| armed_dir())
+    })
 }
 
 /// Where one armed offer's placeholder lives:
@@ -227,24 +271,50 @@ fn placeholder_path(file_id: uuid::Uuid, name: &str) -> PathBuf {
         .join(crate::client::file::sanitize_filename(name))
 }
 
+/// Longest a paste render waits for the pull verdict before giving up
+/// and unlinking the placeholder (Finder surfaces -43).
+///
+/// Must be bounded: while the transport is disconnected the supervisor
+/// skips its stall/restart checks, so a pull can sit un-unfinished
+/// forever — and an unbounded render would leave Finder in "Preparing to
+/// copy" permanently, plus leak the presenter-queue thread if the user
+/// cancels the copy. Sized well above the machinery's own failure bound
+/// while connected — `TAIL_STALL_TIMEOUT_MS` (15 s) across
+/// `MAX_RESTARTS + 1` attempts is ~1 min — with margin for a large but
+/// healthy pull to digest.
+#[cfg(any(target_os = "macos", test))]
+const PASTE_RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Fill `placeholder` from a paste pull's outcome, or delete it so the
 /// waiting reader surfaces a copy error instead of an empty file.
 ///
 /// `spool` is the supervisor's reply to [`PasteEvent::Pull`]: `Ok`
 /// carries the partial path + frontier, `Err` means the offer is gone.
-/// Waits on the frontier for the digest verdict, then copies the verified
-/// bytes into the placeholder — copy, not rename, because the verified
-/// partial stays in the spool for repeat pastes (`paste_sink.ready`) and
-/// `std::fs::copy` on APFS is a clone. A failed pull *or* a failed copy
-/// ends with the placeholder unlinked — Finder then reports error -43,
-/// the analogue of Windows' `E_ABORT`.
+/// Waits on the frontier for the digest verdict — no longer than
+/// [`PASTE_RENDER_TIMEOUT`] — then copies the verified bytes into the
+/// placeholder: copy, not rename, because the verified partial stays in
+/// the spool for repeat pastes (`paste_sink.ready`) and `std::fs::copy`
+/// on APFS is a clone. A failed pull, a timed-out pull *or* a failed
+/// copy ends with the placeholder unlinked — Finder then reports error
+/// -43, the analogue of Windows' `E_ABORT`.
 ///
 /// Platform-neutral so the fill-or-unlink decision is testable without
 /// AppKit; the macOS presenter is the only caller.
 #[cfg(any(target_os = "macos", test))]
 fn render_placeholder(spool: Result<SpoolStream, String>, placeholder: &std::path::Path) {
+    render_placeholder_within(spool, placeholder, PASTE_RENDER_TIMEOUT)
+}
+
+/// [`render_placeholder`] with the deadline as a parameter so tests can
+/// exercise the timeout path without waiting minutes.
+#[cfg(any(target_os = "macos", test))]
+fn render_placeholder_within(
+    spool: Result<SpoolStream, String>,
+    placeholder: &std::path::Path,
+    timeout: std::time::Duration,
+) {
     let filled = spool
-        .and_then(|s| s.frontier.wait().map(|()| s))
+        .and_then(|s| s.frontier.wait_timeout(timeout).map(|()| s))
         .and_then(|s| {
             std::fs::copy(&s.path, placeholder)
                 .map(|_| ())
@@ -871,6 +941,9 @@ mod imp {
         path: PathBuf,
         file_id: Uuid,
         events: UnboundedSender<PasteEvent>,
+        /// Set for the duration of a render, so `disarm` can warn when a
+        /// re-arm kills a paste still waiting on its pull.
+        pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     define_class!(
@@ -899,6 +972,9 @@ mod imp {
             unsafe fn relinquish_to_reader(&self, reader: &ReplyBlock) {
                 let file_id = self.ivars().file_id;
                 info!(file_id = %file_id, "paste requested; starting pull");
+                self.ivars()
+                    .pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
                 let result = match self
                     .ivars()
@@ -926,9 +1002,14 @@ mod imp {
                     as *const block2::DynBlock<dyn Fn()>
                     as *mut block2::DynBlock<dyn Fn()>;
                 reader.call((reacquirer_ptr,));
-                // Foundation retains the reacquirer until the read ends,
-                // but forget ours so it cannot dangle if nothing copies it.
-                std::mem::forget(reacquirer);
+                self.ivars()
+                    .pending
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // `reader.call` hands the reacquirer to Foundation, which
+                // retains it for the rest of the coordinated read — the
+                // documented caller passes a stack-block literal here,
+                // which could not outlive this callback otherwise — so
+                // dropping our RcBlock on return is safe.
             }
 
             /// Nothing but us writes the placeholder — allow immediately.
@@ -942,7 +1023,8 @@ mod imp {
                     as *const block2::DynBlock<dyn Fn()>
                     as *mut block2::DynBlock<dyn Fn()>;
                 writer.call((reacquirer_ptr,));
-                std::mem::forget(reacquirer);
+                // Same retention contract as the reader reply above:
+                // Foundation owns the reacquirer once `call` returns.
             }
 
             #[unsafe(method(accommodatePresentedItemDeletionWithCompletionHandler:))]
@@ -974,17 +1056,24 @@ mod imp {
     );
 
     impl Presenter {
+        /// The presenter plus the flag it sets while a render is in
+        /// flight — the registry keeps the flag so `disarm` can warn
+        /// about kills of in-progress pastes.
         fn new(
             path: PathBuf,
             file_id: Uuid,
             events: UnboundedSender<PasteEvent>,
-        ) -> Retained<Self> {
+        ) -> (
+            Retained<Self>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
             let queue = NSOperationQueue::new();
             queue.setName(Some(&NSString::from_str("clipboardwire.paste.presenter")));
             // One callback at a time per file: the relinquish blocks for
             // the whole pull, and nothing else may interleave on it.
             queue.setMaxConcurrentOperationCount(1);
+            let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let this: Allocated<Self> = unsafe { msg_send![Self::class(), alloc] };
             let this = this.set_ivars(Ivars {
                 url,
@@ -992,8 +1081,9 @@ mod imp {
                 path,
                 file_id,
                 events,
+                pending: pending.clone(),
             });
-            unsafe { msg_send![super(this), init] }
+            (unsafe { msg_send![super(this), init] }, pending)
         }
     }
 
@@ -1010,6 +1100,9 @@ mod imp {
     pub struct MacPaste {
         events: UnboundedSender<PasteEvent>,
         presenters: Vec<Retained<Presenter>>,
+        /// Each presenter's in-flight flag, parallel to `presenters`, so
+        /// `disarm` can log when a re-arm kills a still-running render.
+        pending: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         /// Placeholder paths of the current arm, kept so `disarm` can tell
         /// whether the pasteboard still holds *our* URLs.
         armed_paths: Vec<PathBuf>,
@@ -1038,13 +1131,15 @@ mod imp {
                     );
                     continue;
                 }
-                let presenter = Presenter::new(path.clone(), f.file_id, self.events.clone());
+                let (presenter, pending) =
+                    Presenter::new(path.clone(), f.file_id, self.events.clone());
                 // msg_send! — avoids needing ProtocolObject conformance;
                 // file coordination only checks respondsToSelector:.
                 unsafe {
                     let _: () = msg_send![class!(NSFileCoordinator), addFilePresenter: &*presenter];
                 }
                 self.presenters.push(presenter);
+                self.pending.push(pending);
                 armed.push(path);
             }
             self.armed_paths = armed;
@@ -1069,6 +1164,21 @@ mod imp {
         /// is cleared only while it still holds exactly our armed URLs —
         /// a user copy that landed after the arm keeps the clipboard.
         fn disarm(&mut self) {
+            // A re-arm while a render is still pulling kills that paste
+            // (its placeholder is deleted below → -43). Correct — the new
+            // copy replaces the clipboard — but worth a trace.
+            let in_flight = self
+                .pending
+                .iter()
+                .filter(|p| p.load(std::sync::atomic::Ordering::Relaxed))
+                .count();
+            if in_flight > 0 {
+                warn!(
+                    count = in_flight,
+                    "re-arm killed an in-flight paste render; that paste will fail"
+                );
+            }
+            self.pending.clear();
             for presenter in self.presenters.drain(..) {
                 unsafe {
                     let _: () =
@@ -1108,6 +1218,7 @@ mod imp {
             imp: std::sync::Mutex::new(MacPaste {
                 events,
                 presenters: Vec::new(),
+                pending: Vec::new(),
                 armed_paths: Vec::new(),
             }),
         }
@@ -1293,5 +1404,48 @@ mod tests {
 
         assert!(!placeholder.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_gives_up_and_unlinks_on_timeout() {
+        // A pull that never resolves — e.g. the transport went down and
+        // the stall checks are paused — must still release the reader:
+        // give up after the deadline and unlink so Finder surfaces -43.
+        let dir = scratch("timeout");
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let started = std::time::Instant::now();
+
+        render_placeholder_within(
+            Ok(SpoolStream {
+                path: dir.join("partial"),
+                len: 0,
+                frontier: SpoolFrontier::new(), // verdict never lands
+            }),
+            &placeholder,
+            std::time::Duration::from_millis(50),
+        );
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert!(!placeholder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn placeholder_filter_recognizes_the_canonical_tmp_spelling() {
+        // Whatever spelling `temp_dir()` uses, the same armed root under
+        // TMPDIR's canonical spelling must also be recognized — on macOS
+        // that is `/private/var/folders/...` while `temp_dir()` reports
+        // `/var/folders/...`, the exact pair a pasteboard reader can
+        // hand back.
+        let canon = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join("clipboardwire-paste")
+            .join("armed")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("x.txt");
+        assert!(is_armed_placeholder(&canon));
     }
 }

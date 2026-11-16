@@ -483,14 +483,19 @@ creates a 0-byte placeholder per file at
 general pasteboard. A Cmd+V in Finder coordinates a *read* of the
 placeholder, which fires `relinquishPresentedItemToReader:` on the
 presenter's own `NSOperationQueue` — no STA thread, no runloop. That
-callback runs the same lazy pull, blocks until the SHA-256 verdict, then
-copies the verified bytes into the placeholder and replies
+callback runs the same lazy pull, blocks until the SHA-256 verdict —
+bounded (~3 min), since a disconnected transport never produces one —
+then copies the verified bytes into the placeholder and replies
 (`reader(reacquirer)` — the nested-block signature is what makes an
-asynchronous reply legal). A failed pull unlinks the placeholder before
-replying, so Finder reports error -43 rather than copying an empty file —
-the analogue of Windows' `E_ABORT`. There is no byte progress: Finder
-shows indeterminate "Preparing to copy" for the whole pull, then a normal
-copy. `auto` still resolves to `pickup`; `paste` on macOS is opt-in.
+asynchronous reply legal). A failed or timed-out pull unlinks the
+placeholder before replying, so Finder reports error -43 rather than
+copying an empty file — the analogue of Windows' `E_ABORT`. Only
+coordinated reads reach the callback: a reader that skips
+`NSFileCoordinator` (`cp`, most attachment pickers) copies the 0-byte
+placeholder verbatim and never starts a pull — Finder Cmd+V is the
+supported surface. There is no byte progress: Finder shows indeterminate
+"Preparing to copy" for the whole pull, then a normal copy. `auto` still
+resolves to `pickup`; `paste` on macOS is opt-in.
 
 The spool is invisible cache — pulled once, served to every later paste of
 the same `file_id` without pulling again; the OS temp dir reclaims it.
