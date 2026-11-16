@@ -2,17 +2,19 @@
 
 > Cross-platform clipboard sync over WebSocket. One small Rust binary. Runs on Linux + Windows + MacOS. LAN/VPN-first.
 
-[![CI](https://github.com/davefx/clipboardwire/actions/workflows/ci.yml/badge.svg)](https://github.com/davefx/clipboardwire/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/davefx/clipboardwire?sort=semver)](https://github.com/davefx/clipboardwire/releases/latest)
+[![CI](https://github.com/xixijay1988/clipboardwire/actions/workflows/ci.yml/badge.svg)](https://github.com/xixijay1988/clipboardwire/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/xixijay1988/clipboardwire?sort=semver)](https://github.com/xixijay1988/clipboardwire/releases/latest)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3%2B-blue.svg)](LICENSE)
 
 Copy on one machine, paste on another. Text, images and files. No cloud account, no
-SaaS, no JVM — just a 7 MiB static binary that runs as a tray icon and shuttles
+SaaS, no JVM — just a ~14 MiB static binary that runs as a tray icon and shuttles
 clipboard contents between your trusted devices over an encrypted WebSocket.
 
-It started as a Rust rewrite of the [ClipCascade] server (which is Java/Spring),
-but the wire protocol, threat model, and operational shape were redesigned for a
-single-user / personal-use deployment on a LAN or VPN.
+This is a fork of [davefx/clipboardwire](https://github.com/davefx/clipboardwire),
+which started as a Rust rewrite of the [ClipCascade] server (Java/Spring). This
+fork adds lazy file transfer (`send_mode`/`receive_mode`), paste-time file
+delivery on Windows **and** macOS, a redesigned settings UI, and assorted
+robustness fixes around reconnects, replays, and concurrent clipboard holders.
 
 <table>
   <tr>
@@ -45,12 +47,22 @@ single-user / personal-use deployment on a LAN or VPN.
   Disconnected — retrying in N s), a Settings GUI, and Start/Stop/Restart
   controls for the embedded hub. Runs on Linux (X11 + Wayland via GTK +
   libayatana-appindicator), Windows, and macOS (menu-bar app, no Dock entry).
-- **File sync via the clipboard.** Ctrl+C a file (or several) in
-  Nautilus / Explorer / Finder on one machine; Ctrl+V on another
-  pastes them out of `~/Downloads/clipboardwire/`. Multi-file
-  selections arrive as a single clipboard set after a brief debounce
-  on the receiver. There's also a `clipboardwire send <FILE>` CLI for
-  scripted transfers.
+- **File sync via the clipboard — lazy by default.** Ctrl+C a file
+  (or several) in Explorer / Finder / Nautilus on one machine and the
+  sender only publishes a metadata *offer* — no bytes move yet. What
+  happens next is the receiver's `receive_mode`:
+  - `paste` — a clipboard promise is armed and the bytes are pulled
+    **when you Ctrl+V**, verified against the sender's SHA-256
+    mid-copy. Windows uses OLE delayed rendering; macOS uses an
+    `NSFilePresenter` placeholder the Finder waits on. A failed pull
+    surfaces as a copy error, not an empty file.
+  - `pickup` — offers are fetched the moment they arrive and land in
+    `~/Downloads/clipboardwire/`.
+  - `eager` — classic behaviour: chunks flow at copy time.
+  - `auto` — resolves per platform (today: `pickup` on Windows/macOS).
+
+  Multi-file selections arrive as one clipboard set. There's also a
+  `clipboardwire send <FILE>` CLI for scripted transfers.
 - **Auto-TLS by default.** First time the hub starts it generates a
   self-signed cert under `~/.config/clipboardwire/` (or the platform
   equivalent) with sensible SANs and logs the SHA-256 fingerprint. Clients
@@ -58,9 +70,9 @@ single-user / personal-use deployment on a LAN or VPN.
   on a trusted network.
 - **Embedded-hub mode.** Your always-on workstation can both *be* the
   relay and a clipboard participant — no separate `serve` install needed.
-- **Native packages.** `.deb`, `.rpm`, and `.msi` on every release. The deb
-  ships a systemd unit (for headless server use) and a `.desktop` entry
-  (so the app shows up in GNOME's Settings → Apps and the launcher).
+- **Packaged builds.** Releases ship a universal macOS `.dmg` /
+  `.app.tar.gz` and a Windows `.exe` — one self-contained binary
+  either way. Linux users build from source.
 - **Tests, not vibes.** Tier-1 smoke tests, Linux DBus-driven menu
   interaction tests, Windows UI-Automation tray-discovery tests,
   egui_kittest UI tests for the Settings dialog, an integration test
@@ -69,42 +81,25 @@ single-user / personal-use deployment on a LAN or VPN.
 
 ## Install
 
-### Linux (deb)
-
-```sh
-curl -LO https://github.com/davefx/clipboardwire/releases/latest/download/clipboardwire_0.5.4-1_amd64.deb
-sudo apt install ./clipboardwire_0.5.4-1_amd64.deb
-clipboardwire   # opens the tray; first run pops the Settings dialog
-```
-
-### Linux (rpm)
-
-```sh
-curl -LO https://github.com/davefx/clipboardwire/releases/latest/download/clipboardwire-0.5.4-1.x86_64.rpm
-sudo dnf install ./clipboardwire-0.5.4-1.x86_64.rpm
-```
+This fork's releases ship macOS (`.dmg` / `.app.tar.gz` / bare binaries)
+and a Windows `.exe`. Linux users build from source — see
+[Building from source](#building-from-source); for upstream-style distro
+packages use [davefx/clipboardwire](https://github.com/davefx/clipboardwire).
 
 ### Windows
 
-Download `clipboardwire-0.5.4-x86_64.msi` from the
-[latest release](https://github.com/davefx/clipboardwire/releases/latest)
-and double-click it. The installer creates a Start Menu shortcut, a Desktop
-shortcut, and registers a `HKCU\Run` entry so the tray comes up at login.
+Download `clipboardwire-windows-x86_64.exe` from the
+[latest release](https://github.com/xixijay1988/clipboardwire/releases/latest)
+and run it — it's the same single binary: double-clicking starts the tray
+app. For login autostart add a `HKCU\Run` entry or a shortcut in
+`shell:startup`.
 
 ### macOS
 
-```sh
-brew install --cask davefx/clipboardwire/clipboardwire
-```
-
-That uses the [davefx/homebrew-clipboardwire](https://github.com/davefx/homebrew-clipboardwire)
-tap and downloads `clipboardwire-macos-universal.dmg` from the latest
-release. `brew upgrade --cask clipboardwire` picks up new releases.
-
-Or grab the DMG directly:
+Grab the DMG from the latest release:
 
 ```sh
-curl -LO https://github.com/davefx/clipboardwire/releases/latest/download/clipboardwire-macos-universal.dmg
+curl -LO https://github.com/xixijay1988/clipboardwire/releases/latest/download/clipboardwire-macos-universal.dmg
 hdiutil attach clipboardwire-macos-universal.dmg
 cp -R "/Volumes/clipboardwire/clipboardwire.app" /Applications/
 hdiutil detach "/Volumes/clipboardwire"
@@ -119,7 +114,7 @@ in the menu bar (LSUIElement) — no Dock icon.
 ### Cargo (any platform with Rust 1.89+)
 
 ```sh
-cargo install --git https://github.com/davefx/clipboardwire --locked clipboardwire
+cargo install --git https://github.com/xixijay1988/clipboardwire --locked clipboardwire
 ```
 
 You'll need the GTK / libayatana-appindicator dev headers on Linux. See
@@ -169,6 +164,13 @@ password = "hunter2"
 poll_ms = 300
 # tls_ca_file = "/path/to/self-signed.crt"  # pin a specific cert
 # tls_insecure = true                       # LAN/VPN only
+
+send_mode = "lazy"        # "lazy" publishes file metadata on copy;
+                          # "eager" streams bytes immediately
+receive_mode = "auto"     # "auto" | "paste" | "pickup" | "eager"
+                          # paste: pull when the shell pastes (Windows, macOS)
+                          # pickup: fetch every offer into ~/Downloads/clipboardwire
+                          # eager: ignore offers, eager chunks only
 
 # Optional: bring up a hub server in this same process. Other devices
 # on your network connect to <bind>; the local client routes over
@@ -259,26 +261,38 @@ xvfb-run -a cargo test --workspace -- --ignored        # tray + DBus + UIA
 
 ## Status & roadmap
 
-Currently shipping: **v0.5.4** — see [CHANGELOG.md](CHANGELOG.md).
+Currently shipping: **v0.5.6** — see [CHANGELOG.md](CHANGELOG.md).
 
-v0.4 shipped the big v0.4 roadmap items: file sync via the clipboard
-(Linux X11, Windows CF_HDROP, macOS NSPasteboardTypeFileURL), tray
-icon status overlay, "Pin from server" button in the Settings dialog,
-macOS `.app` / `.dmg` packaging, and a Homebrew tap.
+Highlights of this fork's line:
+
+- **v0.5.5** — lazy file transfer on the wire: `file_offer` /
+  `file_pull` frames, resumable chunked pulls, `send_mode` /
+  `receive_mode`, and paste-time rendering on Windows via OLE
+  `IDataObject` + `IStream` with byte-level progress.
+- **v0.5.6** — settings UI redesign, and a local copy now survives
+  reconnects, replays, and peer churn.
+- **unreleased (main)** — `receive_mode = "paste"` on macOS: offers
+  arm `file://` placeholders under `$TMPDIR` registered through
+  `NSFileCoordinator`/`NSFilePresenter`, so Finder's Cmd+V blocks on
+  a coordinated read until the pull is verified — and reports error
+  -43 on failure instead of copying an empty file.
 
 Still on the list for later patches:
 
+- Flip `receive_mode = "auto"` to `paste` on macOS once the
+  presenter path has soaked (today `auto` → `pickup`).
+- Byte-level progress for macOS paste — needs an `NSFileProvider`
+  extension (signed bundle + XPC + user opt-in); the presenter
+  mechanism only gives Finder an indeterminate "preparing" state.
 - Native Wayland file-clipboard via `wl_data_device` (Xwayland
   already covers most setups, so the urgency is low).
-- A "stop hub at quit" semantics polish so the embedded hub task
-  doesn't outlive the tray if the system shutdowns it via signal.
 - End-to-end encryption between peers — for a deployment shape
   where the hub is on hardware you don't trust (the current
   threat model assumes the hub is in the trust boundary).
 
 ## Contributing
 
-Issues and PRs welcome on [GitHub](https://github.com/davefx/clipboardwire).
+Issues and PRs welcome on [GitHub](https://github.com/xixijay1988/clipboardwire).
 The codebase is a workspace: `core/` is the library (protocol, hub, client
 transport, clipboard adapter), `cli/` is the binary (tray, settings, CLI
 plumbing). Tests are the contract — please add one for any non-trivial
