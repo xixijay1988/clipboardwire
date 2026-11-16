@@ -1,8 +1,0 @@
-{
-  "round": 2,
-  "total_rounds": 3,
-  "pending_operation": "cw-macos-paste-r2",
-  "last_result": "openspec/changes/macos-paste-presenter/impl-report.md",
-  "next_action": "review-fixes-then-archive",
-  "notes": "r2 = Opus review fixes: (1) frontier wait unbounded while disconnected -> hang, add deadline + unlink; (2) mem::forget reacquirer leak, verify Foundation retention before dropping; (3) warn log when arm() kills in-flight render; (4) canonicalize path compare in is_armed_placeholder; (5) document non-coordinating-reader zero-byte boundary. Lead still owes task 3.1 openspec archive after r2 lands."
-}

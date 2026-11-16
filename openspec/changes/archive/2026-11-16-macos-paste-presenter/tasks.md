@@ -63,7 +63,7 @@ reply shape verified).
 
 ## Phase 3 — spec, docs, verification
 
-- [ ] 3.1 Spec delta applied to `openspec/specs/file-transfer/spec.md`
+- [x] 3.1 Spec delta applied to `openspec/specs/file-transfer/spec.md`
       (archive step).
 - [x] 3.2 `ARCHITECTURE.md`: macOS presenter paragraph next to the Windows
       paste-mode section; note "no byte progress, indeterminate Preparing".
