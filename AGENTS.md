@@ -120,3 +120,15 @@ permission prompts. `lody_session_chat` cannot change a session's permission
 mode — mode is fixed at creation. Use `lody_session_create` with
 `machineId` + `agentConfigId` (from `lody_session_create_options`) and
 `modeId: "bypass"` for diagnostic sessions there.
+
+## AppleScript / System Events hazards on this Mac
+
+- Never write a bare `log <identifier>` inside a `tell application "System Events"`
+  block: identifiers resolve against the target app's dictionary, and
+  `log out` matches the real `log out` command (fndrlogo), which sends
+  kAELogOutEvent to loginwindow — a 60-second auto-logout dialog that
+  completes unattended. (This caused an actual session logout 2026-11-16.)
+- Use `log ("label: " & value)` — a leading string literal can't parse as
+  a command — or `return` the accumulated string instead of `log`.
+- This machine is driven remotely via NoMachine; GUI sessions restart when
+  the nx session ends, killing all clipboardwire/tray processes.
