@@ -125,26 +125,50 @@ impl SpoolFrontier {
         g.outcome.clone().unwrap()
     }
 
-    /// Like [`Self::wait`], but gives up after `timeout` with an `Err`
-    /// describing the deadline rather than a pull failure.
+    /// Like [`Self::wait`], but gives up when the pull stops looking
+    /// alive: `Err` if `committed` doesn't grow for `idle`, or if
+    /// `still_valid` — polled on every wake and every `poll` slice —
+    /// goes false. Not a wall-clock deadline: [`Self::update`] bumps
+    /// `committed` and notifies on every chunk, so a healthy pull of
+    /// any size keeps resetting the idle clock, while a disconnected
+    /// transport makes zero progress and still trips it.
     ///
-    /// The macOS render uses this because a pull can stall indefinitely:
-    /// while the transport is disconnected the supervisor skips its
-    /// stall/restart checks entirely, so no verdict ever lands — and an
-    /// unbounded wait would leave the reader (and the presenter-queue
-    /// thread that owns it) parked on the condvar forever.
-    pub fn wait_timeout(&self, timeout: std::time::Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + timeout;
+    /// Two hangs an unbounded wait can't see:
+    ///
+    /// - **Disconnected transport.** The supervisor skips stall/restart
+    ///   checks while offline, so no verdict ever lands — an idle
+    ///   deadline still catches it because nothing commits.
+    /// - **Killed render.** A re-arm deletes the placeholder mid-wait;
+    ///   `still_valid` surfaces that within `poll` rather than waiting
+    ///   out the pull to fail on a copy into a deleted path.
+    ///
+    /// `still_valid` is checked before the outcome: a verdict is only
+    /// renderable while the destination still exists.
+    pub fn wait_idle_while(
+        &self,
+        idle: std::time::Duration,
+        poll: std::time::Duration,
+        still_valid: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut last_committed = 0;
+        let mut deadline = std::time::Instant::now() + idle;
         let mut g = self.inner.lock().unwrap();
         loop {
+            if !still_valid() {
+                return Err("placeholder went away mid-render".to_string());
+            }
             if let Some(outcome) = g.outcome.clone() {
                 return outcome;
             }
+            if g.committed != last_committed {
+                last_committed = g.committed;
+                deadline = std::time::Instant::now() + idle;
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(format!("pull verdict did not arrive within {timeout:?}"));
+                return Err(format!("no pull progress for {idle:?}"));
             }
-            let (guard, _) = self.cond.wait_timeout(g, remaining).unwrap();
+            let (guard, _) = self.cond.wait_timeout(g, remaining.min(poll)).unwrap();
             g = guard;
         }
     }
@@ -271,50 +295,72 @@ fn placeholder_path(file_id: uuid::Uuid, name: &str) -> PathBuf {
         .join(crate::client::file::sanitize_filename(name))
 }
 
-/// Longest a paste render waits for the pull verdict before giving up
-/// and unlinking the placeholder (Finder surfaces -43).
+/// Longest a pull may go *without progress* before a paste render gives
+/// up and unlinks the placeholder (Finder surfaces -43). Idle, not
+/// total: every committed chunk resets it, so an arbitrarily large file
+/// on a slow-but-alive link still renders.
 ///
-/// Must be bounded: while the transport is disconnected the supervisor
-/// skips its stall/restart checks, so a pull can sit un-unfinished
-/// forever — and an unbounded render would leave Finder in "Preparing to
-/// copy" permanently, plus leak the presenter-queue thread if the user
-/// cancels the copy. Sized well above the machinery's own failure bound
-/// while connected — `TAIL_STALL_TIMEOUT_MS` (15 s) across
-/// `MAX_RESTARTS + 1` attempts is ~1 min — with margin for a large but
-/// healthy pull to digest.
+/// Must be bounded because while the transport is disconnected the
+/// supervisor skips its stall/restart checks — a pull can sit
+/// un-unfinished forever, leaving Finder in "Preparing to copy"
+/// permanently and leaking the presenter-queue thread on cancel.
+/// 120 s is ~8× the per-attempt stall budget (`TAIL_STALL_TIMEOUT_MS`
+/// = 15 s): a link that commits nothing for two minutes is functionally
+/// dead — the restart machinery would have exhausted itself anyway —
+/// while a healthy pull rarely goes even one `TAIL_STALL` without a
+/// commit.
 #[cfg(any(target_os = "macos", test))]
-const PASTE_RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const PASTE_RENDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often a waiting render re-checks that its placeholder still
+/// exists — a re-arm deletes `armed/` mid-render, and the render should
+/// fail fast rather than wait out a pull whose output is already gone.
+/// Half a second: imperceptible in a minutes-long pull, cheap to poll.
+#[cfg(any(target_os = "macos", test))]
+const PASTE_RENDER_GONE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Fill `placeholder` from a paste pull's outcome, or delete it so the
 /// waiting reader surfaces a copy error instead of an empty file.
 ///
 /// `spool` is the supervisor's reply to [`PasteEvent::Pull`]: `Ok`
 /// carries the partial path + frontier, `Err` means the offer is gone.
-/// Waits on the frontier for the digest verdict — no longer than
-/// [`PASTE_RENDER_TIMEOUT`] — then copies the verified bytes into the
-/// placeholder: copy, not rename, because the verified partial stays in
-/// the spool for repeat pastes (`paste_sink.ready`) and `std::fs::copy`
-/// on APFS is a clone. A failed pull, a timed-out pull *or* a failed
-/// copy ends with the placeholder unlinked — Finder then reports error
-/// -43, the analogue of Windows' `E_ABORT`.
+/// Waits on the frontier for the digest verdict — giving up after
+/// [`PASTE_RENDER_IDLE_TIMEOUT`] without progress, or within
+/// [`PASTE_RENDER_GONE_POLL`] of the placeholder disappearing — then
+/// copies the verified bytes into the placeholder: copy, not rename,
+/// because the verified partial stays in the spool for repeat pastes
+/// (`paste_sink.ready`) and `std::fs::copy` on APFS is a clone. A failed
+/// pull, an idle pull, a deleted placeholder *or* a failed copy ends
+/// with the placeholder unlinked — Finder then reports error -43, the
+/// analogue of Windows' `E_ABORT`.
 ///
 /// Platform-neutral so the fill-or-unlink decision is testable without
 /// AppKit; the macOS presenter is the only caller.
 #[cfg(any(target_os = "macos", test))]
 fn render_placeholder(spool: Result<SpoolStream, String>, placeholder: &std::path::Path) {
-    render_placeholder_within(spool, placeholder, PASTE_RENDER_TIMEOUT)
+    render_placeholder_within(
+        spool,
+        placeholder,
+        PASTE_RENDER_IDLE_TIMEOUT,
+        PASTE_RENDER_GONE_POLL,
+    )
 }
 
-/// [`render_placeholder`] with the deadline as a parameter so tests can
-/// exercise the timeout path without waiting minutes.
+/// [`render_placeholder`] with the deadlines as parameters so tests can
+/// exercise the give-up paths without waiting minutes.
 #[cfg(any(target_os = "macos", test))]
 fn render_placeholder_within(
     spool: Result<SpoolStream, String>,
     placeholder: &std::path::Path,
-    timeout: std::time::Duration,
+    idle: std::time::Duration,
+    poll: std::time::Duration,
 ) {
     let filled = spool
-        .and_then(|s| s.frontier.wait_timeout(timeout).map(|()| s))
+        .and_then(|s| {
+            s.frontier
+                .wait_idle_while(idle, poll, || placeholder.exists())
+                .map(|()| s)
+        })
         .and_then(|s| {
             std::fs::copy(&s.path, placeholder)
                 .map(|_| ())
@@ -1408,9 +1454,10 @@ mod tests {
 
     #[test]
     fn render_placeholder_gives_up_and_unlinks_on_timeout() {
-        // A pull that never resolves — e.g. the transport went down and
+        // A pull that never commits — e.g. the transport went down and
         // the stall checks are paused — must still release the reader:
-        // give up after the deadline and unlink so Finder surfaces -43.
+        // give up after the idle deadline and unlink so Finder
+        // surfaces -43.
         let dir = scratch("timeout");
         let placeholder = dir.join("armed").join("file.txt");
         std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
@@ -1421,14 +1468,90 @@ mod tests {
             Ok(SpoolStream {
                 path: dir.join("partial"),
                 len: 0,
-                frontier: SpoolFrontier::new(), // verdict never lands
+                frontier: SpoolFrontier::new(), // nothing ever commits
             }),
             &placeholder,
             std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
         );
 
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
         assert!(!placeholder.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_stays_alive_while_progress_arrives() {
+        // The deadline is idle, not wall-clock: updates landing faster
+        // than the idle window keep resetting it, so a pull longer than
+        // the deadline still renders.
+        let dir = scratch("progress");
+        let partial = dir.join("partial");
+        std::fs::write(&partial, b"slow but alive").unwrap();
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let frontier = SpoolFrontier::new();
+        let writer = frontier.clone();
+        let t = std::thread::spawn(move || {
+            // ~280 ms of updates — nearly 3× the 100 ms idle window —
+            // spaced well under it, then the verdict.
+            for i in 1..=7 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                writer.update(i * 1024);
+            }
+            writer.finish(Ok(()));
+        });
+
+        render_placeholder_within(
+            Ok(SpoolStream {
+                path: partial,
+                len: 14,
+                frontier,
+            }),
+            &placeholder,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(20),
+        );
+
+        assert_eq!(std::fs::read(&placeholder).unwrap(), b"slow but alive");
+        t.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_placeholder_fails_fast_when_the_placeholder_is_deleted() {
+        // A re-arm deletes `armed/` mid-render — the render must notice
+        // within a poll slice instead of waiting out the pull to fail
+        // on a copy into a deleted path.
+        let dir = scratch("gone");
+        let partial = dir.join("partial");
+        std::fs::write(&partial, b"doomed bytes").unwrap();
+        let placeholder = dir.join("armed").join("file.txt");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, b"").unwrap();
+        let doomed = placeholder.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::fs::remove_file(&doomed).unwrap();
+        });
+        let started = std::time::Instant::now();
+
+        render_placeholder_within(
+            Ok(SpoolStream {
+                path: partial,
+                len: 12,
+                frontier: SpoolFrontier::new(), // pull never resolves
+            }),
+            &placeholder,
+            std::time::Duration::from_secs(60), // idle deadline far away
+            std::time::Duration::from_millis(10),
+        );
+
+        // ~30 ms + a poll slice, not the 60 s the pull would have taken.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!placeholder.exists());
+        t.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

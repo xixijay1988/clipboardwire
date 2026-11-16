@@ -1,8 +1,8 @@
 {
-  "round": 2,
+  "round": 3,
   "total_rounds": 3,
-  "pending_operation": null,
-  "last_result": "openspec/changes/macos-paste-presenter/impl-report.md",
-  "next_action": "archived",
-  "notes": "r2 fixes verified, committed as 7afc79f. Change archived at openspec/changes/archive/2026-11-16-macos-paste-presenter; spec delta merged into openspec/specs/file-transfer/spec.md (task 3.1 done)."
+  "pending_operation": "cw-macos-paste-r3",
+  "last_result": "openspec/changes/archive/2026-11-16-macos-paste-presenter/impl-report.md",
+  "next_action": "verify-then-finder-smoke",
+  "notes": "r3 = idle-deadline (progress-reset) wait_timeout + fast-fail on placeholder deleted mid-render. After r3 lands: lead verifies gates, commits, then does a real coordinated-read smoke to exercise the r2 mem::forget removal (any NSFileCoordinator read triggers reader(reacquirer); Finder not strictly required), then pushes."
 }

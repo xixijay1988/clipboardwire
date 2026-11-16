@@ -165,3 +165,55 @@ flag → warn). Item 2 is reasoning + Apple API-contract verification —
 the reacquirer MUST be retained by the system to fire after the read,
 and the documented call shape proves it copies — but it has no unit
 test; the real-Finder smoke run exercises it. Item 5 is docs.
+
+## Round 3 — deadline semantics fixes (all in `core/src/client/paste.rs` + docs)
+
+1. **Total → idle deadline.** `wait_timeout(d)` replaced by
+   `wait_idle_while(idle, poll, still_valid)`: each iteration re-checks
+   `committed` (bumped + `notify_all`'d by `update` on every chunk) and
+   resets the deadline when it grew. A 180 s *total* deadline would have
+   killed any healthy pull over 3 min (~360 MB at 2 MB/s); "no progress
+   for N seconds" catches the same disconnect hang (a dead transport
+   commits nothing) while letting arbitrarily large files render.
+   `PASTE_RENDER_TIMEOUT` → `PASTE_RENDER_IDLE_TIMEOUT = 120 s` — ~8×
+   the per-attempt stall budget (`TAIL_STALL_TIMEOUT_MS` = 15 s), so a
+   link idle that long is functionally dead while a healthy pull rarely
+   goes one `TAIL_STALL` without a commit. `wait()` still unchanged.
+   - `render_placeholder_gives_up_and_unlinks_on_timeout` updated for
+     the new signature (verdict never lands → -43 path after idle).
+   - New: `render_placeholder_stays_alive_while_progress_arrives` —
+     280 ms of `update()`s spaced under a 100 ms idle window, then
+     `finish(Ok)` → the render *waits past* the old wall-clock deadline
+     and fills the placeholder.
+2. **Render fails fast when its placeholder is deleted.** `disarm`
+   removes `armed/` mid-render; the render now polls
+   `placeholder.exists()` via `still_valid` inside the wait — checked
+   before every wait slice (and before the outcome, since a verdict is
+   only renderable while the destination exists). Wait slices are capped
+   at `PASTE_RENDER_GONE_POLL = 500 ms` so a gone placeholder surfaces
+   in ≤0.5 s instead of waiting out the pull for a doomed copy.
+   `render_placeholder_within` now takes `(idle, poll)` so tests don't
+   wait out real durations.
+   - New: `render_placeholder_fails_fast_when_the_placeholder_is_deleted`
+     — placeholder unlinked 30 ms into a never-resolving pull, 10 ms
+     poll, 60 s idle → returns promptly (≪5 s, measured ~40 ms) and the
+     copy never happens (placeholder stays absent).
+3. Docs: `ARCHITECTURE.md` and `MANUAL_SMOKE.md` updated from "bounded
+   (~3 min)" to "~2 min without forward progress" + the fail-fast note;
+   smoke item 13 now explains the idle semantics explicitly.
+
+Round-3 gates (all run):
+
+```
+$ cargo fmt --check            → clean
+$ cargo clippy --all-targets -- -D warnings
+                               → Finished dev profile, 0 warnings
+$ cargo test                   → 386 passed; 0 failed (lib, +2 new)
+                               → all integration targets pass
+$ cargo build -p clipboardwire-core --target aarch64-apple-darwin
+                               → Finished dev profile
+```
+
+Both items are test-verified end-to-end through `render_placeholder`
+(the same code path the presenter callback runs); the only unverifiable
+piece remains the real-Finder surface itself.

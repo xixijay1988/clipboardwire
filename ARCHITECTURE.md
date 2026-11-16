@@ -484,7 +484,9 @@ general pasteboard. A Cmd+V in Finder coordinates a *read* of the
 placeholder, which fires `relinquishPresentedItemToReader:` on the
 presenter's own `NSOperationQueue` — no STA thread, no runloop. That
 callback runs the same lazy pull, blocks until the SHA-256 verdict —
-bounded (~3 min), since a disconnected transport never produces one —
+bounded (~2 min without forward progress, since a disconnected
+transport never commits), or fails fast if a re-arm deletes the
+placeholder mid-wait —
 then copies the verified bytes into the placeholder and replies
 (`reader(reacquirer)` — the nested-block signature is what makes an
 asynchronous reply legal). A failed or timed-out pull unlinks the

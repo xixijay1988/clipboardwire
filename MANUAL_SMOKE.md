@@ -121,10 +121,11 @@ macOS receiver:
 13. **Failed pull → -43.** Take the source offline (or let the offer
     expire), then Cmd+V → Finder reports a copy error dialog
     (`错误代码 -43` / "error code -43", item not found) — never an empty
-    file. A paste whose pull stays unresolved past ~3 minutes — e.g.
+    file. A paste whose pull makes no progress for ~2 minutes — e.g.
     the hub dropped mid-paste, where no stall checks run — gives up and
     fails the same way; the pull may still complete into the spool
-    afterwards.
+    afterwards. (A pull that keeps making progress — a large file on a
+    slow link — never trips this: the deadline is idle, not total.)
 14. **Cancel from Preparing.** Cmd+V, then press the stop button in
     Finder's "preparing to copy" dialog → the copy aborts on the Finder
     side; the pull may complete into the spool harmlessly and a later
